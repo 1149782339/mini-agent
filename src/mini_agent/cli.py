@@ -118,11 +118,13 @@ def make_registry(cfg, spill_dir=None) -> ToolRegistry:
     return build_tools(cfg, spill_dir=spill_dir)
 
 
-def run_print_mode(args, cfg) -> int:
+def run_print_mode(args, cfg, llm=None) -> int:
     """print 模式：跑单轮任务后退出（子代理的宿主形态，非交互）。
 
-    stdout 在 --json 下输出 JSONL 事件（message_end/result/error），
-    供父进程（SubagentTool）解析；否则只输出最终答案文本。
+    stdout 在 --json 下**边跑边输出** JSONL 事件（message_end/result/error），
+    供父进程（SubagentTool）解析——message_end 必须随步骤实时发出，
+    攒到最后才吐等于让父进程的面板全程黑屏。
+    llm 参数仅供测试注入假实现。
     """
     if args.model:
         cfg.model = args.model
@@ -149,7 +151,7 @@ def run_print_mode(args, cfg) -> int:
             print("ERROR: --tools 白名单没有匹配到任何工具")
             return 2
 
-    agent = Agent(cfg, registry)
+    agent = Agent(cfg, registry, llm=llm)
     agent.ctx.messages = [{"role": "system", "content": system_prompt}]
 
     def _emit(event: dict) -> None:
@@ -158,14 +160,14 @@ def run_print_mode(args, cfg) -> int:
         elif event.get("type") == "result":
             print(event.get("result") or "", flush=True)
 
-    if not args.json:
-        _force_utf8_stdio()
-    answer = agent.run(args.print_prompt)
-
-    # 逐条吐出 assistant 消息（message_end 事件，Pi 协议），再发 result/error 收尾
-    for msg in agent.ctx.messages:
+    def _forward(event: str, payload: dict) -> None:
+        # 每步模型响应落库后立即转发 message_end（payload 里无 usage，
+        # 从刚写入的 ctx.messages 末位取——assistant 事件先于工具派发触发）
+        if event != "assistant":
+            return
+        msg = agent.ctx.messages[-1] if agent.ctx.messages else {}
         if msg.get("role") != "assistant":
-            continue
+            return
         _emit({
             "type": "message_end",
             "message": {
@@ -175,6 +177,11 @@ def run_print_mode(args, cfg) -> int:
             "usage": msg.get("_usage"),
             "stopReason": msg.get("_finish_reason"),
         })
+
+    if not args.json:
+        _force_utf8_stdio()
+    answer = agent.run(args.print_prompt, _event_override=_forward)
+
     if answer.startswith("ERROR:"):
         _emit({"type": "error", "message": answer})
         return 1

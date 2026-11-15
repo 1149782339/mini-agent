@@ -117,11 +117,14 @@ class Agent:
         )
 
     # ---------- 对外 ----------
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, _event_override: EventHook | None = None) -> str:
+        """跑一轮用户输入直到没有工具调用。_event_override 仅供 print 模式
+        注入事件转发（把 assistant 事件实时转成 message_end 协议）。"""
         text = (user_input or "").strip()
         if not text:
             return ""
 
+        on_event = _event_override or self.on_event
         self._add({"role": "user", "content": text})
 
         for step in range(1, self.cfg.max_steps + 1):
@@ -135,21 +138,21 @@ class Agent:
                         self.ctx.messages,
                         self.registry.schemas(),
                         on_delta=self.on_delta,
-                        on_notice=lambda m: self.on_event("notice", {"message": m}),
+                        on_notice=lambda m: on_event("notice", {"message": m}),
                     )
                     break
                 except ContextOverflowError as exc:
                     if overflow_retried:
-                        self.on_event("error", {"message": str(exc), "step": step})
+                        on_event("error", {"message": str(exc), "step": step})
                         return f"ERROR: {exc}"
                     overflow_retried = True
-                    self.on_event(
+                    on_event(
                         "notice", {"message": "上下文超出模型窗口，先压缩再重试本轮"}
                     )
                     self.ctx.compact(self.llm, self.registry.schemas(), force=True)
                     self._sync_after_compaction()
                 except LLMError as exc:
-                    self.on_event("error", {"message": str(exc), "step": step})
+                    on_event("error", {"message": str(exc), "step": step})
                     return f"ERROR: {exc}"
 
             assistant = {
@@ -158,7 +161,7 @@ class Agent:
                 if not k.startswith("_") or k in ("_usage", "_finish_reason")
             }  # _usage/_finish_reason 是私有字段，发给 API 前由 _wire_messages 剥掉
             self._add(assistant)
-            self.on_event(
+            on_event(
                 "assistant",
                 {
                     "step": step,
@@ -177,13 +180,13 @@ class Agent:
             truncated = response.get("_finish_reason") == "length"
             # 先一次性打印全部 tool_call 行：并行任务全部分配可见，不再像"卡住"
             for call in calls:
-                self.on_event("tool_call", {
+                on_event("tool_call", {
                     "name": call.get("function", {}).get("name", "?"),
                     "arguments": call.get("function", {}).get("arguments", "{}"),
                 })
             results = self._dispatch_batch(calls, truncated)
             for call, result in zip(calls, results):
-                self.on_event("tool_result", {
+                on_event("tool_result", {
                     "name": call.get("function", {}).get("name", "?"),
                     "result": result,
                 })
@@ -195,7 +198,7 @@ class Agent:
                     }
                 )
 
-        self.on_event("error", {"message": "达到最大工具步数"})
+        on_event("error", {"message": "达到最大工具步数"})
         return f"（达到最大工具步数 {self.cfg.max_steps}，已停止）"
 
     # ---------- 内部 ----------
