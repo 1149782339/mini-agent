@@ -16,10 +16,12 @@ parallel/chain 多模式、AbortSignal 细粒度中止（v1 靠 Ctrl+C kill 子�
 """
 from __future__ import annotations
 
+import itertools
 import json
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +47,19 @@ CHILD_TOOLS = "Read,Edit,Write,Glob,Grep,run_command"
 
 MAX_RESULT_CHARS = 50000    # Pi：单任务结果 50KB 上限
 DEFAULT_TIMEOUT = 900       # 子代理最长运行秒数
+
+# 活跃子进程登记：主线程 KeyboardInterrupt 时统一 kill，不留孤儿
+_ACTIVE_PROCS: set[subprocess.Popen] = set()
+_TAG_COUNTER = itertools.count(1)
+
+
+def terminate_active_children() -> None:
+    """杀掉所有在跑的子代理进程（loop 的 KeyboardInterrupt 路径调用）。"""
+    for proc in list(_ACTIVE_PROCS):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 # ---------- 纯函数（可单测） ----------
@@ -103,6 +118,24 @@ def parse_json_events(stdout_text: str) -> dict[str, Any]:
     }
 
 
+def describe_event(event: dict[str, Any]) -> tuple[bool, int, str]:
+    """从 message_end 事件提取进度三元组：(是否assistant步, token总量, 单行摘要)。
+
+    摘要去换行截 40 字符，作为"子代理此刻在干嘛"的展示。
+    """
+    msg = event.get("message") or {}
+    if event.get("type") != "message_end" or msg.get("role") != "assistant":
+        return False, 0, ""
+    usage = event.get("usage") or {}
+    tokens = int(usage.get("total") or 0)
+    snippet = ""
+    for part in msg.get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+            snippet = " ".join(str(part["text"]).split())[:40]
+            break
+    return True, tokens, snippet
+
+
 def truncate_result(text: str, limit: int = MAX_RESULT_CHARS) -> str:
     """Pi truncateHead：保头、绝不在行中间切断。"""
     if len(text) <= limit:
@@ -122,7 +155,8 @@ class SubagentTool(Tool):
         "子代理是独立进程：看不到本会话的任何对话内容，请在 prompt 里写清它需要的"
         "全部上下文（目标、相关路径、约束、已知结论）。它会自己读写文件、运行命令、"
         "验证结果，最后把结论作为本工具的返回值。\n"
-        "- 适合：可以独立闭环、不需要你逐步指挥的任务。\n"
+        "- 适合：可以独立闭环、不需要你逐步指挥的任务；多个互不依赖的任务可以在"
+        "一次响应里发多个 Task 调用，它们会并行执行。\n"
         "- 不适合：一两步就能做完的事（直接自己做更快）。\n"
         "- 任务要自包含：子代理无法向你追问。"
     )
@@ -152,6 +186,16 @@ class SubagentTool(Tool):
         task = args["prompt"].strip()
         timeout = semantic_int(args.get("timeout"), DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT
         timeout = max(60, min(int(timeout), 3600))
+        tag = f"子代理#{next(_TAG_COUNTER)}"
+        hook = getattr(ctx, "event_hook", None)  # 可能为 None（测试/无注入场景）
+
+        def _report(step: int, tokens: int, snippet: str, status: str,
+                    exit_code: int | None = None) -> None:
+            if hook is not None:
+                hook("subagent_progress", {
+                    "tag": tag, "step": step, "tokens": tokens,
+                    "snippet": snippet, "status": status, "exit": exit_code,
+                })
 
         # system prompt 走临时文件（对齐 Pi 的 --append-system-prompt）
         tmp = tempfile.NamedTemporaryFile(
@@ -168,28 +212,56 @@ class SubagentTool(Tool):
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    text=True,            # 流式逐行读需要文本模式
+                    bufsize=1,
+                    encoding="utf-8",
+                    errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
             except OSError as exc:
                 raise ToolError(f"无法启动子代理进程：{exc}", 20) from None
+
+            _ACTIVE_PROCS.add(proc)
+            lines: list[str] = []
+            step = 0
+            tokens = 0
             try:
-                out_raw, err_raw = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
-                raise ToolError(
-                    f"子代理运行超过 {timeout}s 被杀。任务太大请拆小后重试。", 21
-                )
+                # 流式读 stdout：子代理的 message_end 事件边到边解析、边上报，
+                # 父终端通过面板实时看到"第几步、多少 token、在干嘛"
+                deadline = time.monotonic() + timeout
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    lines.append(line)
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    is_step, tok, snippet = describe_event(event)
+                    if is_step:
+                        step += 1
+                        tokens = tok or tokens
+                        _report(step, tokens, snippet, "running")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.kill()
+                    proc.communicate()
+                    raise ToolError(
+                        f"子代理运行超过 {timeout}s 被杀。任务太大请拆小后重试。", 21
+                    )
+                proc.wait(timeout=remaining)
+                _report(step, tokens, "", "done", proc.returncode)
             except KeyboardInterrupt:
                 # 父代理被 Ctrl+C：连带杀掉子进程，不留孤儿
                 proc.kill()
                 proc.communicate()
                 raise
+            finally:
+                _ACTIVE_PROCS.discard(proc)
+            err = (proc.stderr.read() if proc.stderr is not None else "") or ""
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
-        out = out_raw.decode("utf-8", errors="replace") if out_raw else ""
-        err = err_raw.decode("utf-8", errors="replace") if err_raw else ""
+        out = "".join(lines)
         parsed = parse_json_events(out)
 
         if parsed["error"] and not parsed["final"]:
@@ -202,6 +274,6 @@ class SubagentTool(Tool):
             )
 
         final = truncate_result(parsed["final"] or "(子代理未返回文本结果)")
-        meta = {"type": "subagent", "steps": parsed["assistant_count"],
+        meta = {"type": "subagent", "tag": tag, "steps": parsed["assistant_count"],
                 "stop": parsed["last_stop"], "exit": proc.returncode}
         return ToolOutput(final, meta)

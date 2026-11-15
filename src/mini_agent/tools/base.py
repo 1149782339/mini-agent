@@ -16,6 +16,7 @@ fail-closed 默认值（TS 侧 TOOL_DEFAULTS）：is_read_only / is_concurrency_
 from __future__ import annotations
 
 import json
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -107,10 +108,17 @@ class ToolError(Exception):
 
 
 class ToolContext:
-    """工具可见的会话级上下文；文件工具用子类 FileToolContext 扩展。"""
+    """工具可见的会话级上下文；文件工具用子类 FileToolContext 扩展。
+
+    event_hook：工具执行期间向终端上报进度/事件的回调
+    Callable[[kind: str, payload: dict], None]，由 Agent 注入。
+    长耗时工具（如 Task 子代理）用它上报实时进度；没有 hook 时静默，
+    测试与无 TTY 场景零影响。
+    """
 
     def __init__(self, workdir: Path):
         self.workdir = workdir.resolve()
+        self.event_hook: Callable[[str, dict], None] | None = None
 
 
 class Tool(ABC):
@@ -209,7 +217,10 @@ class ToolRegistry:
         if len(text) <= self.max_output:
             return text
         self.spill_dir.mkdir(parents=True, exist_ok=True)
-        spill = self.spill_dir / f"{time.strftime('%Y%m%d_%H%M%S')}_{len(text)}.txt"
+        # 并行派发下同秒可能多个工具同时落盘，文件名带线程 id 防撞
+        spill = self.spill_dir / (
+            f"{time.strftime('%Y%m%d_%H%M%S')}_{threading.get_ident()}_{len(text)}.txt"
+        )
         spill.write_text(text, encoding="utf-8")
         head = text[: self.max_output // 2]
         tail = text[-self.max_output // 4 :]

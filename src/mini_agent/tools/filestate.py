@@ -12,6 +12,7 @@ readFileState 是整个文件工具族的核心状态机（一状态三用）：
 from __future__ import annotations
 
 import os
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,6 +105,7 @@ class FileStateCache:
         self._max_entries = max_entries
         self._max_bytes = max_bytes
         self._bytes = 0
+        self._lock = threading.Lock()  # 并行派发下多个工具可能同时读写
 
     @staticmethod
     def _key(path: Path) -> str:
@@ -111,30 +113,35 @@ class FileStateCache:
 
     def get(self, path: Path) -> FileState | None:
         key = self._key(path)
-        state = self._entries.get(key)
-        if state is not None:
-            self._entries.move_to_end(key)
-        return state
+        with self._lock:
+            state = self._entries.get(key)
+            if state is not None:
+                self._entries.move_to_end(key)
+            return state
 
     def set(self, path: Path, state: FileState) -> None:
         key = self._key(path)
-        old = self._entries.pop(key, None)
-        if old is not None:
-            self._bytes -= len(old.content.encode("utf-8"))
-        self._entries[key] = state
-        self._bytes += len(state.content.encode("utf-8"))
-        while (
-            len(self._entries) > self._max_entries or self._bytes > self._max_bytes
-        ) and self._entries:
-            _, evicted = self._entries.popitem(last=False)
-            self._bytes -= len(evicted.content.encode("utf-8"))
+        encoded_len = len(state.content.encode("utf-8"))
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old.content.encode("utf-8"))
+            self._entries[key] = state
+            self._bytes += encoded_len
+            while (
+                len(self._entries) > self._max_entries or self._bytes > self._max_bytes
+            ) and self._entries:
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= len(evicted.content.encode("utf-8"))
 
     def delete(self, path: Path) -> None:
-        self._entries.pop(self._key(path), None)
+        with self._lock:
+            self._entries.pop(self._key(path), None)
 
     def clear(self) -> None:
-        self._entries.clear()
-        self._bytes = 0
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
 
 
 # ---------- 磁盘文本读写（编码 + 行尾保真） ----------

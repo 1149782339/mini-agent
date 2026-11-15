@@ -65,7 +65,10 @@ stat 会触发 SMB 连接造成 NTLM 凭据泄漏（Claude-Code 同款细节）�
   （`python -m mini_agent -p` print 模式），零继承父会话上下文——交接物只有
   子代理 system prompt + 父模型写好的任务文本（显式交接，想要多少上下文写多少）。
   子代理自己读写文件、运行验证，返回最后一条 assistant 文本（50KB 截断）。
-  print 模式永不注册 Task，子代理不能递归派生。也可用 CLI 直接单跑：
+  print 模式永不注册 Task，子代理不能递归派生。
+  **多个互不依赖的 Task 在一次响应里发出会真并行执行**（线程池，按 tool_calls
+  顺序回填结果），执行期间终端底部有 rich 面板实时显示每个子代理的步骤/token/
+  最新动态，互不交错。也可用 CLI 直接单跑：
   `uv run mini-agent -p "任务" --json --tools "Read,Write"`。
 
 另有 `run_command`（shell 执行，见下）。语义差异一处：Claude-Code 用权限层
@@ -179,6 +182,7 @@ DeepSeek/Kimi/MiniMax 这类 provider 要求 assistant 历史必须带 `reasonin
 uv run python examples/tool_test.py       # 离线，60 项：五件套 + 框架行为
 uv run python examples/context_test.py    # 离线，33 项：压缩管线（切点/摘要/锚点记账，假 LLM）
 uv run python examples/retry_test.py      # 离线，17 项：API 重试分类/退避/溢出恢复（假 API）
+uv run python examples/parallel_test.py   # 离线，16 项：并行派发/顺序回填/串行分区/截断零派发
 uv run python examples/smoke_test.py      # 需要 API key
 uv run python examples/timeout_check.py   # 离线，验证超时清理
 ```
@@ -225,7 +229,8 @@ uv run python examples/timeout_check.py   # 离线，验证超时清理
 - 会话已持久化（`.mini_agent/sessions.db`），但压缩后的原文不保留，只留摘要。
 - API 重试覆盖网络抖动/限流/5xx/流中途断（上限 3 次）；认证错误、参数错误等
   致命错误立即失败。上下文溢出会自动压缩后重试一次。
-- 未实现并行工具执行、审批机制（框架的 `check_permissions` 阶段是预留扩展点）。
+- 审批机制未实现（框架的 `check_permissions` 阶段是预留扩展点）；并行执行仅限
+  `is_concurrency_safe()` 的工具（Task/只读类），Edit/Write 仍串行防同文件竞态。
 - Task 子代理只有 single 模式：无 parallel/chain、无 agents/*.md 自定义定义、
   无运行中流式进度（Ctrl+C 会杀掉子进程）。
 - Read 只支持文本（无图片/PDF/ipynb 多模态）；没有 list_dir 工具，

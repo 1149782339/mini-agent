@@ -4,7 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 from pathlib import Path
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    _HAS_RICH = True
+except ImportError:  # rich 是硬依赖，但保持降级 gracefully
+    _HAS_RICH = False
 
 from .config import load_config, SYSTEM_PROMPT
 from .context import Context
@@ -29,6 +38,69 @@ def _c(text: str, color: str, enabled: bool = True) -> str:
     if not enabled:
         return text
     return f"{COLORS.get(color, '')}{text}{COLORS['reset']}"
+
+
+class SubagentPanels:
+    """rich.Live 底部状态区：每个活跃子代理一块，原地刷新各自的最新输出。
+
+    解决"并行子代理进度交错刷屏"——业界（Claude Code 的 TUI）用多面板各自
+    独立更新，我们 REPL 仍是行打印主体，只在底部开一个 transient 状态区：
+    子代理全部结束后面板自动消失，最终 tool_result 行照常打印在上方。
+    非 TTY（管道/重定向）自动禁用。
+    """
+
+    def __init__(self, enabled: bool = True):
+        self._enabled = enabled and _HAS_RICH and sys.stdout.isatty()
+        self._tasks: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._live: Live | None = None
+
+    def update(self, payload: dict) -> None:
+        with self._lock:
+            self._tasks[payload["tag"]] = payload
+            if not self._enabled:
+                return
+            if payload.get("status") == "running" and self._live is None:
+                self._live = Live(
+                    self._render(), console=Console(),
+                    transient=True, refresh_per_second=8,
+                )
+                self._live.start()
+            if self._live is not None:
+                self._live.update(self._render())
+            if self._live is not None and all(
+                t.get("status") == "done" for t in self._tasks.values()
+            ):
+                self._live.stop()
+                self._live = None
+
+    def stop_all(self, reason: str = "中断") -> None:
+        """REPL 中断/退出时收尾：运行中的标记为中断并关闭面板。"""
+        with self._lock:
+            for t in self._tasks.values():
+                if t.get("status") == "running":
+                    t["status"] = "done"
+                    t["snippet"] = f"[{reason}]"
+            if self._live is not None:
+                self._live.stop()
+                self._live = None
+
+    def _render(self) -> Panel:
+        rows = []
+        for tag, t in self._tasks.items():
+            if t.get("status") == "done":
+                status, style = "完成", "green"
+            else:
+                status, style = "运行", "yellow"
+            tokens = t.get("tokens") or 0
+            tok = f"{tokens / 1000:.1f}K tok" if tokens else "- tok"
+            snippet = t.get("snippet") or ""
+            rows.append(f"[{style}]{status}[/{style}] {tag}  "
+                        f"第{t.get('step', 0)}步 · {tok}  [dim]{snippet}[/dim]")
+        return Panel(
+            "\n".join(rows) if rows else "[dim]（无）[/dim]",
+            title="子代理", border_style="dim", padding=(0, 1),
+        )
 
 
 def _force_utf8_stdio() -> None:
@@ -116,6 +188,7 @@ class StreamPrinter:
         self.show_reasoning = show_reasoning
         self.mode: str | None = None
         self.printed_content = False
+        self.panels = SubagentPanels(enabled=color)
 
     def _flush(self) -> None:
         if self.mode is not None:
@@ -164,6 +237,9 @@ class StreamPrinter:
         elif event == "notice":
             # 重试 / 溢出恢复等提示（区别于思维的灰、进度的黄，用暗青）
             print(_c(f"  [{payload['message']}]", "cyan", self.color))
+        elif event == "subagent_progress":
+            # 子代理实时进度：进底部面板，原地刷新，不滚屏
+            self.panels.update(payload)
         elif event == "compaction":
             print(
                 _c(
@@ -315,6 +391,7 @@ def main() -> None:
         try:
             answer = agent.run(line)
         except KeyboardInterrupt:
+            printer.panels.stop_all()
             print("\n（已中断本轮）")
             continue
         if answer and not printer.printed_content:
@@ -323,6 +400,7 @@ def main() -> None:
         print()
 
     # Claude Code 同款退出提示：告诉用户怎么恢复本次会话
+    printer.panels.stop_all()
     print()
     print(_c("Resume this session with:", "dim", color))
     print(_c(f"mini-agent --resume {session_id}", "cyan", color))
