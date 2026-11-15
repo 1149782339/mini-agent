@@ -85,11 +85,22 @@ class Agent:
             if not calls:
                 return response.get("content") or "(模型返回空内容)"
 
+            # Pi 的 failToolCallsFromTruncatedMessage：finish_reason=length 说明
+            # 思维链吃光了输出预算、工具参数被截断（残缺 JSON 能解析但 silently
+            # 不完整，执行了更糟）。不派发，直接回合成错误让模型缩小输出重试。
+            truncated = response.get("_finish_reason") == "length"
             for call in calls:
                 name = call.get("function", {}).get("name", "?")
                 args = call.get("function", {}).get("arguments", "{}")
                 self.on_event("tool_call", {"name": name, "arguments": args})
-                result = self.registry.dispatch(name, args)
+                if truncated:
+                    result = (
+                        f"ERROR: {name} 的参数被输出预算截断（finish_reason=length），"
+                        "内容不完整，未执行。请缩小单次输出后重试：写大文件时分成多个"
+                        " Write（每个 ≤100 行），或减少不必要的推理长度。"
+                    )
+                else:
+                    result = self.registry.dispatch(name, args)
                 self.on_event("tool_result", {"name": name, "result": result})
                 self._add(
                     {
