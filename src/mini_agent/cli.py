@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from pathlib import Path
 
 from .config import load_config, SYSTEM_PROMPT
 from .context import Context
@@ -42,6 +44,68 @@ def _force_utf8_stdio() -> None:
 def make_registry(cfg, spill_dir=None) -> ToolRegistry:
     # 落盘目录跟着会话库走：会话库已经做过可写回退，这里就不用再踩一次主目录
     return build_tools(cfg, spill_dir=spill_dir)
+
+
+def run_print_mode(args, cfg) -> int:
+    """print 模式：跑单轮任务后退出（子代理的宿主形态，非交互）。
+
+    stdout 在 --json 下输出 JSONL 事件（message_end/result/error），
+    供父进程（SubagentTool）解析；否则只输出最终答案文本。
+    """
+    if args.model:
+        cfg.model = args.model
+    system_prompt = SYSTEM_PROMPT
+    if args.append_system_prompt:
+        try:
+            extra = Path(args.append_system_prompt).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"ERROR: 读取 system prompt 文件失败：{exc}")
+            return 2
+        if extra.strip():
+            system_prompt = f"{system_prompt}\n\n{extra.strip()}"
+
+    registry = build_tools(cfg)
+    # 防递归：print 模式永不提供 Task，子代理不能再派子代理
+    registry.tools.pop("Task", None)
+    if args.tools:
+        wanted = {s.strip() for s in args.tools.split(",") if s.strip()}
+        wanted.discard("Task")
+        registry.tools = {k: v for k, v in registry.tools.items() if k in wanted}
+        if not registry.tools:
+            print("ERROR: --tools 白名单没有匹配到任何工具")
+            return 2
+
+    agent = Agent(cfg, registry)
+    agent.ctx.messages = [{"role": "system", "content": system_prompt}]
+
+    def _emit(event: dict) -> None:
+        if args.json:
+            print(json.dumps(event, ensure_ascii=False), flush=True)
+        elif event.get("type") == "result":
+            print(event.get("result") or "", flush=True)
+
+    if not args.json:
+        _force_utf8_stdio()
+    answer = agent.run(args.print_prompt)
+
+    # 逐条吐出 assistant 消息（message_end 事件，Pi 协议），再发 result/error 收尾
+    for msg in agent.ctx.messages:
+        if msg.get("role") != "assistant":
+            continue
+        _emit({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": msg.get("content") or ""}],
+            },
+            "usage": msg.get("_usage"),
+            "stopReason": msg.get("_finish_reason"),
+        })
+    if answer.startswith("ERROR:"):
+        _emit({"type": "error", "message": answer})
+        return 1
+    _emit({"type": "result", "result": answer, "steps": None})
+    return 0
 
 
 class StreamPrinter:
@@ -123,6 +187,15 @@ def main() -> None:
     parser.add_argument("--continue", "-c", dest="cont", action="store_true",
                         help="继续最近一次会话")
     parser.add_argument("--list", "-l", action="store_true", help="列出已有会话")
+    parser.add_argument("-p", "--print", dest="print_prompt", metavar="PROMPT",
+                        help="print 模式：跑单轮任务后退出（非交互，子代理的宿主形态）")
+    parser.add_argument("--json", action="store_true",
+                        help="print 模式下 stdout 按行输出 JSON 事件（message_end/result/error）")
+    parser.add_argument("--no-session", action="store_true", help="不写会话文件")
+    parser.add_argument("--append-system-prompt", metavar="FILE",
+                        help="把文件内容追加到 system prompt 后")
+    parser.add_argument("--model", metavar="MODEL", help="覆盖模型名")
+    parser.add_argument("--tools", metavar="列表", help="逗号分隔的工具白名单")
     args = parser.parse_args()
 
     try:
@@ -131,6 +204,12 @@ def main() -> None:
     except SystemExit as exc:
         print(exc)
         raise SystemExit(1)
+
+    if args.print_prompt is not None:
+        if not args.print_prompt.strip():
+            print("ERROR: -p 的任务文本不能为空")
+            raise SystemExit(2)
+        raise SystemExit(run_print_mode(args, cfg))
 
     color = sys.stdout.isatty()
     store = SessionStore()

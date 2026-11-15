@@ -61,6 +61,12 @@ stat 会触发 SMB 连接造成 NTLM 凭据泄漏（Claude-Code 同款细节）�
 - **Glob**：任意目录可搜。`rg --files` 按文件名找文件，修改时间最新在前，截断 100 条。
 - **Grep**：ripgrep 全功能映射（content/files_with_matches/count、-i/-A/-B/-C、
   glob/type/multiline、head_limit+offset 翻页），超时与无匹配严格区分。
+- **Task**：子代理委派（移植自 Pi 的 subagent 扩展示例）。子代理是**独立进程**
+  （`python -m mini_agent -p` print 模式），零继承父会话上下文——交接物只有
+  子代理 system prompt + 父模型写好的任务文本（显式交接，想要多少上下文写多少）。
+  子代理自己读写文件、运行验证，返回最后一条 assistant 文本（50KB 截断）。
+  print 模式永不注册 Task，子代理不能递归派生。也可用 CLI 直接单跑：
+  `uv run mini-agent -p "任务" --json --tools "Read,Write"`。
 
 另有 `run_command`（shell 执行，见下）。语义差异一处：Claude-Code 用权限层
 deny 规则做文件排除，mini-agent 无权限层，Glob/Grep 默认用 rg 原生语义
@@ -87,7 +93,8 @@ src/mini_agent/
     ├── glob_tool.py   # Glob（rg --files）
     ├── grep_tool.py   # Grep（rg 全功能映射）
     ├── rg.py          # ripgrep 子进程封装（超时/退出码语义）
-    └── shell.py       # run_command：继承环境变量、超时杀进程组、cwd 受限
+    ├── shell.py       # run_command：继承环境变量、超时杀进程组、cwd 受限
+    └── subagent.py    # Task：子代理委派（spawn 自己的 print 模式，移植自 Pi）
 ```
 
 ## 压缩怎么做的（移植自 Pi 的上下文管理）
@@ -128,6 +135,7 @@ src/mini_agent/
 | `MINI_AGENT_KEEP_RECENT_TOKENS` | 20000 | 压缩时尾部保留的 token 预算（Pi keepRecentTokens，小窗口自适应收缩） |
 | `MINI_AGENT_WORKDIR` | `.` | 文件工具可达范围 |
 | `MINI_AGENT_ENABLE_SHELL` | `1` | 设为 `0` 关闭 run_command 工具 |
+| `MINI_AGENT_ENABLE_SUBAGENT` | `1` | 设为 `0` 关闭 Task 子代理工具 |
 | `MINI_AGENT_RG_ALL` | 未设 | 设 `1` 后 Glob/Grep 搜索隐藏文件且忽略 .gitignore |
 | `MINI_AGENT_SHOW_REASONING` | `1` | 是否在终端实时打印思维链 |
 | `MINI_AGENT_DB` | `<项目根>/.mini_agent/sessions.db` | 会话库路径 |
@@ -218,6 +226,8 @@ uv run python examples/timeout_check.py   # 离线，验证超时清理
 - API 重试覆盖网络抖动/限流/5xx/流中途断（上限 3 次）；认证错误、参数错误等
   致命错误立即失败。上下文溢出会自动压缩后重试一次。
 - 未实现并行工具执行、审批机制（框架的 `check_permissions` 阶段是预留扩展点）。
+- Task 子代理只有 single 模式：无 parallel/chain、无 agents/*.md 自定义定义、
+  无运行中流式进度（Ctrl+C 会杀掉子进程）。
 - Read 只支持文本（无图片/PDF/ipynb 多模态）；没有 list_dir 工具，
   看目录用 `run_command` 的 ls。
 - Glob/Grep 的排除规则来自 rg 原生语义（隐藏文件/.gitignore），

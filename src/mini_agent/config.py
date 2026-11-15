@@ -36,6 +36,7 @@ class Config:
     max_tool_output: int = 8000      # 单条工具结果字符上限，超出截断
     max_steps: int = 40              # 单轮最多工具循环次数
     keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算（Pi keepRecentTokens）
+    enable_subagent: bool = True    # 是否注册 Task 子代理工具（print 模式永不注册）
     enable_shell: bool = True        # 是否注册 run_command 工具
     shell: str = "auto"              # run_command 的 shell：auto / gitbash / cmd
     show_reasoning: bool = True      # 默认在终端打印思维链
@@ -71,6 +72,8 @@ def load_config(env_file: str | Path | None = None) -> Config:
         keep_recent_tokens=int(os.environ.get("MINI_AGENT_KEEP_RECENT_TOKENS", Config.keep_recent_tokens)),
         max_output_tokens=int(os.environ.get("MINI_AGENT_MAX_OUTPUT_TOKENS", Config.max_output_tokens)),
         enable_shell=os.environ.get("MINI_AGENT_ENABLE_SHELL", "1").strip().lower()
+        not in {"0", "false", "no", "off"},
+        enable_subagent=os.environ.get("MINI_AGENT_ENABLE_SUBAGENT", "1").strip().lower()
         not in {"0", "false", "no", "off"},
         shell=os.environ.get("MINI_AGENT_SHELL", "auto").strip().lower() or "auto",
         show_reasoning=os.environ.get("MINI_AGENT_SHOW_REASONING", "1").strip().lower()

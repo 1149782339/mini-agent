@@ -21,13 +21,15 @@ from .glob_tool import GlobTool
 from .grep_tool import GrepTool
 from .read import ReadTool
 from .shell import ShellTools
+from .subagent import SubagentTool
 from .write import WriteTool
 
 __all__ = [
     "FnTool", "Tool", "ToolContext", "ToolError", "ToolOutput", "ToolRegistry",
     "ValidationResult", "decode_output", "semantic_bool", "semantic_int",
     "FileState", "FileStateCache", "FileToolContext",
-    "ReadTool", "EditTool", "WriteTool", "GlobTool", "GrepTool", "ShellTools",
+    "ReadTool", "EditTool", "WriteTool", "GlobTool", "GrepTool",
+    "ShellTools", "SubagentTool",
     "build_tools",
 ]
 
@@ -50,4 +52,6 @@ def build_tools(cfg, spill_dir: Path | None = None) -> ToolRegistry:
     if cfg.enable_shell:
         for tool in ShellTools(cfg.workdir, shell=cfg.shell).tools():
             registry.register(tool)
+    if cfg.enable_subagent:
+        registry.register(SubagentTool())
     return registry
