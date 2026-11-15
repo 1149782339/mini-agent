@@ -55,7 +55,11 @@ class StreamPrinter:
 
     def _flush(self) -> None:
         if self.mode is not None:
-            print()
+            if self.mode == "progress":
+                # 擦除进度行，避免残留刷屏
+                print("\r" + " " * 44 + "\r", end="")
+            else:
+                print()
             self.mode = None
 
     def delta(self, kind: str, text: str) -> None:
@@ -66,6 +70,14 @@ class StreamPrinter:
                 self._flush()
                 self.mode = "reasoning"
             print(_c(text, "dim", self.color), end="", flush=True)
+        elif kind == "progress":
+            # 工具参数生成心跳（大文件 Write/Edit 的 JSON 有几千 token，
+            # 流式期间终端死寂）：同行刷新，不换行
+            if self.mode != "progress":
+                self._flush()
+                self.mode = "progress"
+            print(_c(f"\r  …正在生成工具参数 {text} 字符", "dim", self.color),
+                  end="", flush=True)
         else:
             if self.mode != "content":
                 self._flush()

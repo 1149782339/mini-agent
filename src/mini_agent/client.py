@@ -138,6 +138,7 @@ class LLM:
             calls: dict[int, dict[str, str]] = {}
             finish: str | None = None
             usage: dict[str, int] | None = None
+            last_progress = [0]
 
             try:
                 for chunk in stream:
@@ -185,6 +186,12 @@ class LLM:
                                 slot["name"] += fn.name
                             if getattr(fn, "arguments", None):
                                 slot["arguments"] += fn.arguments
+                                # 大文件 Write/Edit 的参数可能有几千 token 的 JSON，
+                                # 流式期间终端本来一片死寂——每 ~500 字符报一次进度
+                                arg_chars = sum(len(s["arguments"]) for s in calls.values())
+                                if on_delta and arg_chars - last_progress[0] >= 500:
+                                    last_progress[0] = arg_chars
+                                    on_delta("progress", str(arg_chars))
             except Exception as exc:
                 raise LLMError(f"stream interrupted: {type(exc).__name__}: {exc}") from exc
 
