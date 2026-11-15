@@ -97,6 +97,9 @@ class StreamPrinter:
         elif event == "tool_result":
             preview = str(payload["result"]).replace("\n", " ")[:160]
             print(_c(f"    ← {preview}", "dim", self.color))
+        elif event == "notice":
+            # 重试 / 溢出恢复等提示（区别于思维的灰、进度的黄，用暗青）
+            print(_c(f"  [{payload['message']}]", "cyan", self.color))
         elif event == "compaction":
             print(
                 _c(

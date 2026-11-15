@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from .client import LLM, LLMError
+from .client import ContextOverflowError, LLM, LLMError
 from .config import Config
 from .context import Context
 from .tools import ToolRegistry
@@ -58,13 +58,30 @@ class Agent:
         for step in range(1, self.cfg.max_steps + 1):
             self._compact_if_needed()
 
-            try:
-                response = self.llm.chat_stream(
-                    self.ctx.messages, self.registry.schemas(), on_delta=self.on_delta
-                )
-            except LLMError as exc:
-                self.on_event("error", {"message": str(exc), "step": step})
-                return f"ERROR: {exc}"
+            # 上下文溢出（Pi 的 overflow recovery）：先压缩再重试本轮，恰好一次
+            overflow_retried = False
+            while True:
+                try:
+                    response = self.llm.chat_stream(
+                        self.ctx.messages,
+                        self.registry.schemas(),
+                        on_delta=self.on_delta,
+                        on_notice=lambda m: self.on_event("notice", {"message": m}),
+                    )
+                    break
+                except ContextOverflowError as exc:
+                    if overflow_retried:
+                        self.on_event("error", {"message": str(exc), "step": step})
+                        return f"ERROR: {exc}"
+                    overflow_retried = True
+                    self.on_event(
+                        "notice", {"message": "上下文超出模型窗口，先压缩再重试本轮"}
+                    )
+                    self.ctx.compact(self.llm, self.registry.schemas(), force=True)
+                    self._sync_after_compaction()
+                except LLMError as exc:
+                    self.on_event("error", {"message": str(exc), "step": step})
+                    return f"ERROR: {exc}"
 
             assistant = {
                 k: v

@@ -170,6 +170,7 @@ DeepSeek/Kimi/MiniMax 这类 provider 要求 assistant 历史必须带 `reasonin
 ```bash
 uv run python examples/tool_test.py       # 离线，60 项：五件套 + 框架行为
 uv run python examples/context_test.py    # 离线，33 项：压缩管线（切点/摘要/锚点记账，假 LLM）
+uv run python examples/retry_test.py      # 离线，17 项：API 重试分类/退避/溢出恢复（假 API）
 uv run python examples/smoke_test.py      # 需要 API key
 uv run python examples/timeout_check.py   # 离线，验证超时清理
 ```
@@ -211,9 +212,11 @@ uv run python examples/timeout_check.py   # 离线，验证超时清理
 
 ## 已知限制
 
-- token 估算是启发式（±15%），不是 tiktoken 精确值。
+- token 估算优先用 provider 真实 usage 锚定（无锚点时启发式 ±15%）。
 - 压缩摘要会丢失细节，只保关键信息；极长会话需要多轮压缩。
 - 会话已持久化（`.mini_agent/sessions.db`），但压缩后的原文不保留，只留摘要。
+- API 重试覆盖网络抖动/限流/5xx/流中途断（上限 3 次）；认证错误、参数错误等
+  致命错误立即失败。上下文溢出会自动压缩后重试一次。
 - 未实现并行工具执行、审批机制（框架的 `check_permissions` 阶段是预留扩展点）。
 - Read 只支持文本（无图片/PDF/ipynb 多模态）；没有 list_dir 工具，
   看目录用 `run_command` 的 ls。

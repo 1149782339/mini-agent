@@ -6,12 +6,66 @@
 """
 from __future__ import annotations
 
+import random
+import time
 from typing import Any, Callable
 
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from .config import Config
 from .tokens import count_tokens_json, message_tokens
+
+
+# ---------- 错误分类与退避（API 重试） ----------
+# 场景：长任务跑到一半网络抖动/限流，旧行为直接 LLMError 终止本轮，用户手动重发。
+# 分层：SDK(max_retries=2) 只管"请求阶段"；这层管"流中途断"和漏网的 429/5xx。
+
+MAX_ERROR_ATTEMPTS = 3      # 本层重试上限（不含 SDK 内部的 2 次）
+_OVERFLOW_MARKERS = (
+    "context length", "maximum context length", "context window",
+    "too long", "reduce the length", "exceed",
+)
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+class ContextOverflowError(LLMError):
+    """上下文超出模型窗口：不是普通 400，压缩后重试本轮才有意义。"""
+
+
+def _classify_api_error(exc: Exception) -> str:
+    """retry=可重试 / overflow=上下文溢出 / fatal=重试无意义。"""
+    text = str(exc).lower()
+    if isinstance(exc, APIStatusError):
+        if exc.status_code == 400:
+            if any(m in text for m in _OVERFLOW_MARKERS):
+                return "overflow"
+            return "fatal"  # 参数错误等，重试不会变好
+        if exc.status_code == 429 or exc.status_code >= 500:
+            return "retry"
+        return "fatal"
+    if isinstance(exc, (APITimeoutError, APIConnectionError)):
+        return "retry"
+    return "retry"  # 未知异常（如流中途断的底层错误）倾向重试，次数上限兜底
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """尊重 429 的 Retry-After 响应头。"""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if value:
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _backoff_seconds(attempt: int, exc: Exception) -> float:
+    return _retry_after_seconds(exc) or min(2 ** attempt, 8) + random.uniform(0, 0.5)
 
 
 def _field(obj: Any, name: str):
@@ -27,10 +81,6 @@ def _field(obj: Any, name: str):
     if isinstance(extra, dict):
         return extra.get(name)
     return None
-
-
-class LLMError(RuntimeError):
-    pass
 
 
 class LLM:
@@ -95,11 +145,13 @@ class LLM:
         messages: list[dict],
         tools: list[dict] | None = None,
         on_delta: Callable[[str, str], None] | None = None,
+        on_notice: Callable[[str], None] | None = None,
     ) -> dict:
         """流式请求：边收边回调，最后返回拼装完整的消息。
 
         on_delta(kind, text)：kind 为 "reasoning" 或 "content"。
         tool_calls 是分片下发的，按 index 聚合 name/arguments。
+        on_notice(text)：重试等异常情况时给用户看的提示行。
         """
         kwargs: dict[str, Any] = {
             "model": self.cfg.model,
@@ -119,9 +171,28 @@ class LLM:
         # 已经吐过字则不重试，避免重复打印。
         budget = self.cfg.max_output_tokens
         ceiling = max(budget, 32768)
-        emitted = False
+        error_attempts = 0
+
+        def _handle_error(exc: Exception) -> bool:
+            """可重试 → 退避并返回 True（continue）；否则抛对应错误。"""
+            nonlocal error_attempts
+            action = _classify_api_error(exc)
+            if action == "overflow":
+                raise ContextOverflowError(str(exc)) from exc
+            if action == "retry" and error_attempts < MAX_ERROR_ATTEMPTS:
+                error_attempts += 1
+                wait = _backoff_seconds(error_attempts, exc)
+                if on_notice:
+                    on_notice(
+                        f"API 错误（{type(exc).__name__}），{wait:.1f}s 后重试"
+                        f"（{error_attempts}/{MAX_ERROR_ATTEMPTS}）"
+                    )
+                time.sleep(wait)
+                return True
+            raise LLMError(f"{type(exc).__name__}: {exc}") from exc
 
         while True:
+            emitted = False  # 每次尝试单独记账：重试后 budget 饥饿判定才正确
             kwargs["max_tokens"] = budget
             try:
                 stream = self.client.chat.completions.create(**kwargs)
@@ -131,7 +202,8 @@ class LLM:
                     # 端点不支持 include_usage：去掉参数重试，本轮退回纯估算
                     kwargs.pop("stream_options")
                     continue
-                raise LLMError(f"{type(exc).__name__}: {exc}") from exc
+                if _handle_error(exc):
+                    continue
 
             content: list[str] = []
             reasoning: list[str] = []
@@ -197,7 +269,9 @@ class LLM:
                                     ) or "工具"
                                     on_delta("progress", f"{names} {arg_chars}")
             except Exception as exc:
-                raise LLMError(f"stream interrupted: {type(exc).__name__}: {exc}") from exc
+                if _handle_error(exc):
+                    continue  # 流中途断：整请求重试（已吐出的字会重印，提示行已说明）
+                raise  # 不可达，_handle_error 内部非 True 即抛
 
             starved = finish == "length" and not content and not calls
             if not starved or emitted or budget >= ceiling:
@@ -226,16 +300,23 @@ class LLM:
 
         Pi 的"拒收半成品"原则：finish_reason 为 length/content_filter 或正文为空，
         一律抛 LLMError，调用方走机械裁剪兜底——坏摘要永久污染会话比不摘要更糟。
+        网络类错误重试 2 次（压缩失败本来就有机械兜底，这里少重试无妨）。
         """
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.cfg.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=2048,
-            )
-        except Exception as exc:
-            raise LLMError(f"summary failed: {type(exc).__name__}: {exc}") from exc
+        resp: Any = None
+        for attempt in range(1, 3 + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.cfg.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=2048,
+                )
+                break
+            except Exception as exc:
+                if _classify_api_error(exc) == "retry" and attempt < 3:
+                    time.sleep(_backoff_seconds(attempt, exc))
+                    continue
+                raise LLMError(f"summary failed: {type(exc).__name__}: {exc}") from exc
 
         choice = resp.choices[0]
         finish = getattr(choice, "finish_reason", None)
