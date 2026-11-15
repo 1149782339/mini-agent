@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 密钥与本地环境
+.env
+
+# 运行时数据（SQLite 会话库、超长工具输出落盘）
+.mini_agent/
+
+# agent 实验/测试工作区（运行产物，非本项目代码）
+sandbox/
+work_dir/
+agent-dir/
+demo_data/
