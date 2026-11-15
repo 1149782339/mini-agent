@@ -78,7 +78,7 @@ class StreamPrinter:
                 self.mode = "progress"
             name, _, count = text.rpartition(" ")
             label = f" {name} 的参数" if name else "工具参数"
-            print(_c(f"\r  …正在生成{label} {count} 字符", "dim", self.color),
+            print(_c(f"\r  …正在生成{label} {count} 字符", "yellow", self.color),
                   end="", flush=True)
         else:
             if self.mode != "content":
