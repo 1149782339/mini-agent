@@ -30,12 +30,12 @@ class Config:
     model: str = "deepseek-v4.1-flash-economy"
     context_window: int = 1000000
     compact_ratio: float = 0.7
-    keep_recent: int = 6
     max_output_tokens: int = 16384
     temperature: float = 0.3
     workdir: Path = field(default_factory=lambda: Path.cwd())
     max_tool_output: int = 8000      # 单条工具结果字符上限，超出截断
     max_steps: int = 40              # 单轮最多工具循环次数
+    keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算（Pi keepRecentTokens）
     enable_shell: bool = True        # 是否注册 run_command 工具
     shell: str = "auto"              # run_command 的 shell：auto / gitbash / cmd
     show_reasoning: bool = True      # 默认在终端打印思维链
@@ -68,7 +68,7 @@ def load_config(env_file: str | Path | None = None) -> Config:
         model=os.environ.get("MINI_AGENT_MODEL", Config.model),
         context_window=int(os.environ.get("MINI_AGENT_CONTEXT_WINDOW", Config.context_window)),
         compact_ratio=float(os.environ.get("MINI_AGENT_COMPACT_RATIO", Config.compact_ratio)),
-        keep_recent=int(os.environ.get("MINI_AGENT_KEEP_RECENT", Config.keep_recent)),
+        keep_recent_tokens=int(os.environ.get("MINI_AGENT_KEEP_RECENT_TOKENS", Config.keep_recent_tokens)),
         max_output_tokens=int(os.environ.get("MINI_AGENT_MAX_OUTPUT_TOKENS", Config.max_output_tokens)),
         enable_shell=os.environ.get("MINI_AGENT_ENABLE_SHELL", "1").strip().lower()
         not in {"0", "false", "no", "off"},

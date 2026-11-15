@@ -1,16 +1,34 @@
-"""对话历史 + 自动压缩（context compaction）。
+"""对话历史 + 自动压缩（context compaction），压缩管线移植自 Pi。
 
-压缩三段式：
-1. 触发：请求估算超过窗口的 compact_ratio；
-2. 切分：从尾部保留 keep_recent 条，向前挪动切点，避免劈开 assistant(tool_calls) / tool 配对；
-3. 摘要：把头部交给 LLM 生成交接笔记，替换成一条 [COMPACTION] 消息；
-   失败则退化为机械裁剪（丢掉最老一半），仍然保证配对完整。
+相比旧版（按条数切 + 自由文本摘要）的改动：
+1. 切分：token 预算制（keep_recent_tokens，Pi keepRecentTokens）——从最新往回
+   累加估算到预算即停；切点绝不切断 toolCall/toolResult 配对
+   （compaction.find_cut_point）；
+2. 摘要：输入先序列化成 [User]/[Tool result] 标签文本（防模型续写对话、
+   工具结果限 2000 字符、思维链丢弃），固定 6 节结构模板；有旧摘要时走
+   "更新合并"模式而非重写；
+3. 文件清单：<read-files>/<modified-files> 从工具调用参数机械提取，
+   确定性附加在摘要尾（跨次压缩随摘要文本累积）；
+4. 质量闸：摘要为空/被截断(finish_reason=length)/像续写或报错 → 拒收，
+   走机械裁剪兜底（坏摘要永久污染会话比不摘要更糟）；
+5. 记账：request_size 用 usage 锚点 + 增量粗估（client.context_tokens）。
+
+未移植（见 README）：split-turn 双摘要、分支摘要、append-only 事件树投影、
+溢出自动恢复（provider 报错格式相关）。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from .client import LLM, LLMError, request_size
+from .compaction import (
+    append_file_lists,
+    build_summary_prompt,
+    extract_file_operations,
+    find_cut_point,
+    looks_like_bad_summary,
+    serialize_for_summary,
+)
 from .config import Config, SYSTEM_PROMPT
 
 
@@ -49,23 +67,37 @@ class Context:
         self.log.clear()
 
     # ---------- 切分 ----------
-    def _find_split(self) -> int:
-        """返回切点 cut：head = messages[1:cut]，tail = messages[cut:]。"""
-        n = len(self.messages)
-        if n <= 2:
-            return n
-        cut = max(1, n - self.cfg.keep_recent)
-        # 若切点落在 tool 消息上，往前挪到它的 assistant 之前，保证配对不裂
-        while cut > 1 and self.messages[cut].get("role") == "tool":
-            cut -= 1
-        # 切点若紧跟 assistant(tool_calls)，同样前移，避免尾部以孤立 tool 开头
-        while cut > 1:
-            prev = self.messages[cut - 1]
-            if prev.get("role") == "assistant" and prev.get("tool_calls"):
-                cut -= 1
-            else:
-                break
-        return max(1, cut)
+    def _keep_tokens(self, tools: list[dict] | None = None) -> int:
+        """尾部保留预算：Pi 默认 20K；窗口很小的场景（测试/小模型）自适应收缩，
+        且永远不超过压缩阈值的一半，保证切完真的能降下来。"""
+        threshold = self.cfg.compact_threshold
+        return min(self.cfg.keep_recent_tokens, max(1000, threshold // 2))
+
+    def _find_split(self, tools: list[dict] | None = None) -> int:
+        """切点：tail = messages[cut:] 保留，head = messages[1:cut] 进摘要。"""
+        return find_cut_point(self.messages, self._keep_tokens(tools))
+
+    def _previous_summary(self) -> str:
+        """从历史里取出上一份压缩摘要（迭代式摘要的"旧摘要"输入）。"""
+        for msg in self.messages:
+            content = str(msg.get("content") or "")
+            if content.startswith(COMPACTION_MARKER):
+                body = content[len(COMPACTION_MARKER):]
+                parts = body.split("\n\n", 1)
+                text = parts[1] if len(parts) == 2 else body
+                return text.rsplit("[以上为历史摘要", 1)[0].strip()
+        return ""
+
+    @staticmethod
+    def _marker_message(summary_text: str) -> dict:
+        return {
+            "role": "user",
+            "content": (
+                f"{COMPACTION_MARKER} 以下是此前对话的压缩摘要：\n\n"
+                f"{summary_text}\n\n"
+                "[以上为历史摘要；以下为最近的真实对话，请接着处理]"
+            ),
+        }
 
     # ---------- 校验 ----------
     def validate(self, tools: list[dict] | None = None) -> list[str]:
@@ -113,50 +145,51 @@ class Context:
         before = self.size(tools)
         attempts = 0
         summarised = False
-        snapshot = list(self.messages)
         dropped = 0
+        snapshot = list(self.messages)
 
         while attempts < max_attempts and (force or self.should_compact(tools)):
             attempts += 1
-            cut = self._find_split()
+            cut = self._find_split(tools)
             if cut <= 1:
                 break
             head = self.messages[1:cut]
             tail = self.messages[cut:]
-            dropped += len(head)
+
+            previous = self._previous_summary()
+            read_files, modified_files = extract_file_operations(head)
+            prompt = build_summary_prompt(
+                serialize_for_summary(head),
+                previous,
+                read_files,
+                modified_files,
+            )
 
             summary_text = ""
             try:
-                summary_text = llm.summarize(head)
+                candidate = llm.summarize(prompt)
+                if looks_like_bad_summary(candidate):
+                    raise LLMError("summary rejected by quality gate")
+                # 文件清单确定性附加，不让 LLM 自由发挥路径
+                summary_text = append_file_lists(candidate, read_files, modified_files)
                 summarised = True
             except LLMError:
                 summary_text = ""
 
             if summary_text:
-                summary_msg = {
-                    "role": "user",
-                    "content": (
-                        f"{COMPACTION_MARKER} 以下是此前对话的压缩摘要"
-                        f"（压缩发生于第 {len(self.messages)} 条消息之后）：\n\n"
-                        f"{summary_text}\n\n"
-                        "[以上为历史摘要；以下为最近的真实对话，请接着处理]"
-                    ),
-                }
-                self.messages = [self.messages[0], summary_msg, *tail]
+                dropped += len(head)
+                self.messages = [self.messages[0], self._marker_message(summary_text), *tail]
             else:
-                # 兜底：机械保留后半段
-                half = max(1, len(self.messages) // 2)
-                while half > 1 and self.messages[half].get("role") == "tool":
-                    half -= 1
-                dropped += half - 1
-                self.messages = [self.messages[0], *self.messages[half:]]
+                # 摘要失败：机械裁掉最老一半（保底，仍保证配对完整）
+                kept = self._mechanical_trim()
+                if kept is None:
+                    break
 
             problems = self.validate(tools)
             if problems:
-                # 校验失败：回滚并走机械裁剪，最多两次
+                # 校验失败：回滚本轮改动，机械裁剪一次，仍不行就放弃
                 self.messages = snapshot
-                self._mechanical_trim()
-                if not self.validate(tools):
+                if self._mechanical_trim() is None:
                     break
 
         after = self.size(tools)
@@ -170,18 +203,21 @@ class Context:
         self.log.append(report)
         return report
 
-    def _mechanical_trim(self) -> None:
+    def _mechanical_trim(self) -> int | None:
+        """机械保留较新的一半（不切 tool 消息）。返回切点；无需裁剪返回 None。"""
         n = len(self.messages)
         if n <= 2:
-            return
+            return None
         half = max(1, n // 2)
         while half > 1 and self.messages[half].get("role") == "tool":
             half -= 1
         self.messages = [self.messages[0], *self.messages[half:]]
+        return half
 
     def force_fit(self, tools: list[dict] | None = None) -> None:
         """最后一道保险：反复机械裁剪直到进入窗口。"""
         guard = 0
         while self.size(tools) > self.cfg.context_window and len(self.messages) > 2 and guard < 40:
-            self._mechanical_trim()
+            if self._mechanical_trim() is None:
+                break
             guard += 1

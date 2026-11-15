@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from .base import FnTool, decode_output
+from ..store import project_data_dir
 
 DEFAULT_TIMEOUT = 60
 HARD_TIMEOUT = 300
@@ -267,10 +268,25 @@ class ShellTools:
             raise PermissionError(f"cwd 越界：{target} 不在 {self.workdir} 内") from None
         return target
 
-    def _clip(self, text: str) -> str:
+    def _clip(self, text: str, tag: str = "out") -> str:
+        """超长输出：完整内容落盘 spill/，上下文里只保留末尾（Pi truncateTail）。
+
+        保尾不保头——错误信息几乎总在输出末尾，旧版保头会把关键报错剪掉。
+        """
         if len(text) <= MAX_BUFFER:
             return text
-        return text[:MAX_BUFFER] + f"\n[... 输出超过 {MAX_BUFFER} 字符，已截断 ...]"
+        try:
+            spill_dir = project_data_dir() / "spill"
+            spill_dir.mkdir(parents=True, exist_ok=True)
+            path = spill_dir / f"bash_{tag}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.txt"
+            path.write_text(text, encoding="utf-8")
+            note = (
+                f"[完整输出 {len(text)} 字符已保存到 {path}，"
+                f"以下为末尾 {MAX_BUFFER} 字符]\n"
+            )
+        except OSError:
+            note = f"[输出共 {len(text)} 字符，以下为末尾 {MAX_BUFFER} 字符]\n"
+        return note + text[-MAX_BUFFER:]
 
     # ---------- 工具实现 ----------
     def run_command(self, command: str, timeout: int | None = None, cwd: str | None = None) -> str:
@@ -340,9 +356,9 @@ class ShellTools:
             + ("  [TIMEOUT，已杀进程树]" if timed_out else "")
         ]
         if out.strip():
-            parts.append("--- stdout ---\n" + self._clip(out.rstrip()))
+            parts.append("--- stdout ---\n" + self._clip(out.rstrip(), "stdout"))
         if err.strip():
-            parts.append("--- stderr ---\n" + self._clip(err.rstrip()))
+            parts.append("--- stderr ---\n" + self._clip(err.rstrip(), "stderr"))
         if not out.strip() and not err.strip():
             parts.append("(无输出)")
         return "\n".join(parts)

@@ -66,7 +66,11 @@ class Agent:
                 self.on_event("error", {"message": str(exc), "step": step})
                 return f"ERROR: {exc}"
 
-            assistant = {k: v for k, v in response.items() if not k.startswith("_")}
+            assistant = {
+                k: v
+                for k, v in response.items()
+                if not k.startswith("_") or k in ("_usage", "_finish_reason")
+            }  # _usage/_finish_reason 是私有字段，发给 API 前由 _wire_messages 剥掉
             self._add(assistant)
             self.on_event(
                 "assistant",

@@ -39,6 +39,8 @@ FILE_UNCHANGED_STUB = (
 )
 
 MAX_LINES_TO_READ = 2000  # TS 侧 MAX_LINES_TO_READ（默认读取行数）
+MAX_BODY_CHARS = 50000    # Pi truncate.ts：单次输出字节帽（先到先赢）
+MAX_LINE_CHARS = 2000     # 单行截断（防 minified 行刷屏，Grep 侧还有 --max-columns 500）
 _STREAM_THRESHOLD = 10 * 1024 * 1024  # TS 侧 readFileInRange 快路径阈值
 
 # TS 侧 isBlockedDevicePath：会阻塞或产生无限输出的设备文件（路径黑名单，无 I/O）
@@ -175,7 +177,22 @@ class ReadTool(Tool):
                 f"无法读取二进制文件 {target}。它是二进制文件，请用合适的工具分析。", 5
             )
 
+        # 单行截断（Pi：超长行不能整行塞给模型）
+        chunk = [
+            (ln[:MAX_LINE_CHARS] + " …[本行过长已截断]") if len(ln) > MAX_LINE_CHARS else ln
+            for ln in chunk
+        ]
+
         body = "\n".join(f"{i + offset:>6}\t{line}" for i, line in enumerate(chunk))
+        # 输出字节帽（Pi truncateHead：保头、绝不在行中间切断）
+        if len(body) > MAX_BODY_CHARS:
+            body = body[:MAX_BODY_CHARS]
+            if "\n" in body:
+                body = body[: body.rfind("\n")]
+            body += (
+                f"\n[单次输出超过 {MAX_BODY_CHARS} 字符已截断，"
+                f"用 offset/limit 继续读]"
+            )
         if estimate_text_tokens(body) > fctx.max_read_tokens:
             raise ToolError(
                 f"读取结果超出 token 上限（约 {fctx.max_read_tokens}）。"

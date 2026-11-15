@@ -125,9 +125,9 @@ def main() -> bool:
 
     huge = SANDBOX / "huge.txt"
     with open(huge, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write("".join(f"{i:08x} data\n" for i in range(12000)))  # ≈ 300KB 多行
+        fh.write("".join(f"{i:08x} data\n" for i in range(20000)))  # ≈ 280KB > 256KB
     r = d(reg, "Read", file_path="huge.txt")
-    check("整读字节帽拒绝", r.startswith("ERROR") and "offset/limit" in r, r)
+    check("整读字节帽拒绝", r.startswith("ERROR") and "文件过大" in r, r)
     r = d(reg, "Read", file_path="huge.txt", offset=1, limit=10)
     check("范围读绕过字节帽", "     1\t" in r and "已显示 1-10" in r, r)
 

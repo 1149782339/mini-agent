@@ -72,8 +72,9 @@ deny 规则做文件排除，mini-agent 无权限层，Glob/Grep 默认用 rg �
 src/mini_agent/
 ├── config.py       # 环境变量 / .env / ARK_API_KEY 回退
 ├── tokens.py       # 无依赖 token 估算（ASCII 3.5 字符/token，中文 1 字/token）
-├── client.py       # OpenAI 兼容客户端；丢弃 reasoning_content
-├── context.py      # 历史管理 + 压缩（切分 / 摘要 / 校验 / 兜底）
+├── client.py       # OpenAI 兼容客户端；丢弃 reasoning_content；usage 锚点
+├── compaction.py   # 压缩纯函数：切点 / 摘要序列化 / 文件清单 / 模板（移植自 Pi）
+├── context.py      # 历史管理 + 压缩（token 预算切分 / 结构化摘要 / 质量闸 / 兜底）
 ├── store.py        # SQLite 会话持久化（sessions + messages 两表）
 ├── loop.py         # 主循环：请求 → tool_calls → 回填 → 再请求
 ├── cli.py          # REPL
@@ -89,15 +90,30 @@ src/mini_agent/
     └── shell.py       # run_command：继承环境变量、超时杀进程组、cwd 受限
 ```
 
-## 压缩怎么做的
+## 压缩怎么做的（移植自 Pi 的上下文管理）
 
-1. **触发**：请求估算（消息 + 工具 schema）超过 `context_window × compact_ratio`（默认 65536 × 0.65）。
-2. **切分**：从尾部保留 `keep_recent` 条，切点向前挪动，避免把 `assistant(tool_calls)` 和它对应的 `tool` 结果劈开。
-3. **摘要**：头部历史交给同一个模型，固定 prompt 生成 ≤400 字交接笔记（已完成事项 / 文件路径 / 待办 / 关键参数 / 调用链），替换成一条 `[COMPACTION]` 消息。
-4. **校验**：压缩后检查 system 在首位、每条 tool 都能找到 tool_call、总量不超窗口；失败则回滚。
-5. **兜底**：摘要调用失败 → 机械裁剪（丢最老一半）；仍超限 → 二次压缩；最后 `force_fit` 反复裁剪直到进窗口。
+1. **记账**：token 估算优先用 provider 真实 usage 做锚点——最后一条 assistant
+   消息的 `_usage.total`（流式 `include_usage` 带回）≈ 当时上下文规模，之后的
+   消息按启发式增量估算；锚点之后发生过压缩则锚点作废、全量重估。
+2. **触发**：请求估算（消息 + 工具 schema）超过 `context_window × compact_ratio`。
+3. **切分**：token 预算制（`keep_recent_tokens`，默认 20000，小窗口自适应收缩）——
+   从最新往回累加估算到预算即停；切点**绝不切断 toolCall/toolResult 配对**
+   （宁可多保留往前挪）。
+4. **摘要**：头部先序列化成 `[User]/[Assistant]/[Tool result]` 标签文本
+   （防模型续写对话；工具结果限 2000 字符、思维链丢弃），用固定 6 节结构
+   （Goal / Constraints / Progress / Key Decisions / Next Steps /
+   Critical Context）；有旧摘要时走"更新合并"模式而非重写。
+5. **文件清单**：`<read-files>/<modified-files>` 从工具调用参数**机械提取**
+   （不靠 LLM），确定性附加在摘要尾，跨次压缩随摘要文本累积。
+6. **质量闸**：摘要为空 / finish_reason=length（被截断）/ 像续写或报错 →
+   拒收，走机械裁剪兜底——坏摘要永久污染会话比不摘要更糟。
+7. **校验**：压缩后检查 system 在首位、每条 tool 都能找到 tool_call、总量不超
+   窗口；失败回滚 + 机械裁剪。
 
-单条工具输出超过 `max_tool_output`（8000 字符）时，全文落盘到项目内 `.mini_agent/spill/`，只回传头尾 + 省略提示。
+源头截断（Pi 的"三层收缩"第一层）：Read 单次输出 50000 字符封顶（不在行中间
+切断，提示 offset 继续）、单行超 2000 字符截断；run_command 超 40KB 保留**末尾**
+（错误在尾部）并把完整输出落盘 `.mini_agent/spill/`、结果里带路径引用。
+未移植：split-turn 双摘要、分支摘要、append-only 事件树投影、溢出自动恢复。
 
 ## 环境变量
 
@@ -108,7 +124,7 @@ src/mini_agent/
 | `MINI_AGENT_MODEL` | `deepseek-v4.1-flash-economy` | 模型名 |
 | `MINI_AGENT_CONTEXT_WINDOW` | 1000000 | 窗口 token（V4.1-Flash 原生 1M 输入） |
 | `MINI_AGENT_COMPACT_RATIO` | 0.7 | 压缩触发比例（即约 70 万 token 时触发） |
-| `MINI_AGENT_KEEP_RECENT` | 6 | 压缩保留条数 |
+| `MINI_AGENT_KEEP_RECENT_TOKENS` | 20000 | 压缩时尾部保留的 token 预算（Pi keepRecentTokens，小窗口自适应收缩） |
 | `MINI_AGENT_WORKDIR` | `.` | 文件工具可达范围 |
 | `MINI_AGENT_ENABLE_SHELL` | `1` | 设为 `0` 关闭 run_command 工具 |
 | `MINI_AGENT_RG_ALL` | 未设 | 设 `1` 后 Glob/Grep 搜索隐藏文件且忽略 .gitignore |
@@ -151,10 +167,16 @@ DeepSeek/Kimi/MiniMax 这类 provider 要求 assistant 历史必须带 `reasonin
 ## 测试
 
 ```bash
-uv run python examples/tool_test.py       # 离线，55 项：五件套 + 框架行为
+uv run python examples/tool_test.py       # 离线，60 项：五件套 + 框架行为
+uv run python examples/context_test.py    # 离线，33 项：压缩管线（切点/摘要/锚点记账，假 LLM）
 uv run python examples/smoke_test.py      # 需要 API key
 uv run python examples/timeout_check.py   # 离线，验证超时清理
 ```
+
+`context_test` 不需要模型（LLM 用假实现），覆盖：切点绝不拆 toolCall/toolResult
+配对、摘要输入序列化（思维链丢弃/2000 字符截断）、文件清单机械提取、6 节模板
+与更新模式、坏摘要拒收、机械裁剪兜底、usage 锚点记账与压缩后作废、小窗口预算
+自适应。
 
 `tool_test` 不需要模型，覆盖：read-before-write、staleness 闸（含 mtime
 假阳性内容兜底）、CRLF/UTF-16/BOM 写回保真、弯引号容错、file_unchanged

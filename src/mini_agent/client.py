@@ -6,13 +6,12 @@
 """
 from __future__ import annotations
 
-import json
 from typing import Any, Callable
 
 from openai import OpenAI
 
 from .config import Config
-from .tokens import count_tokens_json
+from .tokens import count_tokens_json, message_tokens
 
 
 def _field(obj: Any, name: str):
@@ -107,6 +106,9 @@ class LLM:
             "messages": self._wire_messages(messages),
             "temperature": self.cfg.temperature,
             "stream": True,
+            # 让最后一个流式 chunk 带回 usage（Pi/Claude-Code 的 token 锚点记账
+            # 都靠它）；个别 OpenAI 兼容端点不认这个参数，失败时退回去重试一次
+            "stream_options": {"include_usage": True},
         }
         if tools:
             kwargs["tools"] = tools
@@ -124,15 +126,31 @@ class LLM:
             try:
                 stream = self.client.chat.completions.create(**kwargs)
             except Exception as exc:
+                msg = str(exc)
+                if "stream_options" in msg and "stream_options" in kwargs:
+                    # 端点不支持 include_usage：去掉参数重试，本轮退回纯估算
+                    kwargs.pop("stream_options")
+                    continue
                 raise LLMError(f"{type(exc).__name__}: {exc}") from exc
 
             content: list[str] = []
             reasoning: list[str] = []
             calls: dict[int, dict[str, str]] = {}
             finish: str | None = None
+            usage: dict[str, int] | None = None
 
             try:
                 for chunk in stream:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage is not None:
+                        # include_usage 的收尾 chunk：choices 为空，只有 usage
+                        prompt_toks = int(getattr(chunk_usage, "prompt_tokens", 0) or 0)
+                        completion_toks = int(getattr(chunk_usage, "completion_tokens", 0) or 0)
+                        usage = {
+                            "input": prompt_toks,
+                            "output": completion_toks,
+                            "total": prompt_toks + completion_toks,
+                        }
                     if not chunk.choices:
                         continue
                     choice = chunk.choices[0]
@@ -188,39 +206,79 @@ class LLM:
                 for index, slot in sorted(calls.items())
             ]
         msg["_finish_reason"] = finish
+        if usage is not None:
+            msg["_usage"] = usage  # 私有字段：发给 API 前由 _wire_messages 剥掉
         return msg
 
-    def summarize(self, history: list[dict]) -> str:
-        """把一段历史压成交接笔记。失败抛 LLMError，调用方处理兜底。"""
-        body = json.dumps(history, ensure_ascii=False)
-        prompt = (
-            "请把下面的对话压缩成交接笔记，不超过 400 字。必须保留：\n"
-            "1) 已经完成的事情和改过的文件路径；\n"
-            "2) 尚未完成的待办；\n"
-            "3) 关键事实、参数、用户明确表达的偏好；\n"
-            "4) 正在进行的工具调用链（如果被截断）。\n"
-            "只写对话里真实出现过的内容，不要编造，不要寒暄。\n\n"
-            f"对话记录：\n{body}"
-        )
+    def summarize(self, prompt: str) -> str:
+        """执行一次摘要请求。prompt 由 compaction.build_summary_prompt 构建。
+
+        Pi 的"拒收半成品"原则：finish_reason 为 length/content_filter 或正文为空，
+        一律抛 LLMError，调用方走机械裁剪兜底——坏摘要永久污染会话比不摘要更糟。
+        """
         try:
             resp = self.client.chat.completions.create(
                 model=self.cfg.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=1200,
+                max_tokens=2048,
             )
         except Exception as exc:
             raise LLMError(f"summary failed: {type(exc).__name__}: {exc}") from exc
 
-        text = (resp.choices[0].message.content or "").strip()
+        choice = resp.choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        if finish in ("length", "content_filter"):
+            raise LLMError(f"summary truncated (finish_reason={finish})，拒收半成品")
+        text = (choice.message.content or "").strip()
         if not text:
             raise LLMError("summary returned empty content")
         return text
 
 
+def context_tokens(messages: list[dict]) -> int:
+    """Pi/Claude-Code 同款的"锚点 + 粗估"上下文记账。
+
+    从后往前找最近一条带真实 usage 的 assistant 消息（私有字段 _usage，
+    chat_stream 在 include_usage 时填充）：锚点 total ≈ 当时请求的 input+output，
+    即当时的上下文规模；锚点之后的消息用启发式逐条估算。
+    锚点之前若发生过压缩（[COMPACTION] 标记在其后），锚点作废、全量估算——
+    它统计过的上下文大部分已被丢进摘要。
+    """
+    anchor_total: int | None = None
+    anchor_index = -1
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") == "assistant":
+            usage = msg.get("_usage")
+            if isinstance(usage, dict) and usage.get("total"):
+                anchor_total = int(usage["total"])
+                anchor_index = i
+                break
+
+    if anchor_total is None:
+        return count_tokens(messages)
+
+    # 锚点之后发生过压缩 → 锚点上下文已被摘要替换，作废
+    for msg in messages[anchor_index + 1:]:
+        content = str(msg.get("content") or "")
+        if content.startswith("[COMPACTION]"):
+            return count_tokens(messages)
+
+    total = anchor_total
+    for msg in messages[anchor_index + 1:]:
+        total += message_tokens(msg)
+    return total
+
+
+def count_tokens(messages: list[dict]) -> int:
+    """无锚点时的全量启发式估算。"""
+    return sum(message_tokens(m) for m in messages)
+
+
 def request_size(messages: list[dict], tools: list[dict] | None = None) -> int:
-    """一次请求的估算 token 总量（含工具 schema）。"""
-    total = count_tokens_json(messages)
+    """一次请求的估算 token 总量（含工具 schema）：锚点记账 + schema 估算。"""
+    total = context_tokens(messages)
     if tools:
         total += count_tokens_json(tools)
     return total
