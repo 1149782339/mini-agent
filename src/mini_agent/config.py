@@ -34,7 +34,7 @@ class Config:
     temperature: float = 0.3
     workdir: Path = field(default_factory=lambda: Path.cwd())
     max_tool_output: int = 8000      # 单条工具结果字符上限，超出截断
-    max_steps: int = 40              # 单轮最多工具循环次数
+    max_steps: int = 40              # 单轮最多工具循环次数（子代理经 env 提到 150）
     keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算（Pi keepRecentTokens）
     enable_subagent: bool = True    # 是否注册 Task 子代理工具（print 模式永不注册）
     enable_shell: bool = True        # 是否注册 run_command 工具
@@ -71,6 +71,7 @@ def load_config(env_file: str | Path | None = None) -> Config:
         compact_ratio=float(os.environ.get("MINI_AGENT_COMPACT_RATIO", Config.compact_ratio)),
         keep_recent_tokens=int(os.environ.get("MINI_AGENT_KEEP_RECENT_TOKENS", Config.keep_recent_tokens)),
         max_output_tokens=int(os.environ.get("MINI_AGENT_MAX_OUTPUT_TOKENS", Config.max_output_tokens)),
+        max_steps=int(os.environ.get("MINI_AGENT_MAX_STEPS", Config.max_steps)),
         enable_shell=os.environ.get("MINI_AGENT_ENABLE_SHELL", "1").strip().lower()
         not in {"0", "false", "no", "off"},
         enable_subagent=os.environ.get("MINI_AGENT_ENABLE_SUBAGENT", "1").strip().lower()

@@ -126,6 +126,8 @@ def run_print_mode(args, cfg) -> int:
     """
     if args.model:
         cfg.model = args.model
+    if getattr(args, "max_steps", None):
+        cfg.max_steps = args.max_steps
     system_prompt = SYSTEM_PROMPT
     if args.append_system_prompt:
         try:
@@ -272,6 +274,8 @@ def main() -> None:
                         help="把文件内容追加到 system prompt 后")
     parser.add_argument("--model", metavar="MODEL", help="覆盖模型名")
     parser.add_argument("--tools", metavar="列表", help="逗号分隔的工具白名单")
+    parser.add_argument("--max-steps", type=int, metavar="N",
+                        help="覆盖单轮最大工具步数（深调研任务可调大）")
     args = parser.parse_args()
 
     try:

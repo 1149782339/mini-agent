@@ -135,6 +135,7 @@ src/mini_agent/
 | `MINI_AGENT_CONTEXT_WINDOW` | 1000000 | 窗口 token（V4.1-Flash 原生 1M 输入） |
 | `MINI_AGENT_COMPACT_RATIO` | 0.7 | 压缩触发比例（即约 70 万 token 时触发） |
 | `MINI_AGENT_MAX_OUTPUT_TOKENS` | 32768 | 单次响应输出预算（思维链+正文+工具参数共享）；长思考+大文件场景给小了会被 length 截断 |
+| `MINI_AGENT_MAX_STEPS` | 40 | 单轮最大工具步数；子代理自动提到 150（深调研需要） |
 | `MINI_AGENT_KEEP_RECENT_TOKENS` | 20000 | 压缩时尾部保留的 token 预算（Pi keepRecentTokens，小窗口自适应收缩） |
 | `MINI_AGENT_WORKDIR` | `.` | 文件工具可达范围 |
 | `MINI_AGENT_ENABLE_SHELL` | `1` | 设为 `0` 关闭 run_command 工具 |

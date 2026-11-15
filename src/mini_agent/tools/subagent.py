@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,11 @@ CHILD_TOOLS = "Read,Edit,Write,Glob,Grep,run_command"
 
 MAX_RESULT_CHARS = 50000    # Pi：单任务结果 50KB 上限
 DEFAULT_TIMEOUT = 900       # 子代理最长运行秒数
+CHILD_MAX_STEPS = 150       # 子代理步数预算：深调研（读十几个文件）40 步不够，
+                            # 进程是独立 load_config()，经环境变量覆盖给它
+
+# 子进程 stdout 里出现这个 = 子代理被步数上限截断，结果不完整
+_STEP_LIMIT_NOTICE = "达到最大工具步数"
 
 # 活跃子进程登记：主线程 KeyboardInterrupt 时统一 kill，不留孤儿
 _ACTIVE_PROCS: set[subprocess.Popen] = set()
@@ -158,7 +164,8 @@ class SubagentTool(Tool):
         "- 适合：可以独立闭环、不需要你逐步指挥的任务；多个互不依赖的任务可以在"
         "一次响应里发多个 Task 调用，它们会并行执行。\n"
         "- 不适合：一两步就能做完的事（直接自己做更快）。\n"
-        "- 任务要自包含：子代理无法向你追问。"
+        "- 任务要自包含：子代理无法向你追问；步数预算约 150 步，过大的调研请"
+        "按子系统/目录拆开派发。"
     )
     parameters = {
         "type": "object",
@@ -205,10 +212,14 @@ class SubagentTool(Tool):
             tmp.write(CHILD_SYSTEM_PROMPT)
             tmp.close()
             argv = build_child_argv(task, tmp.name)
+            # 子进程是独立 load_config()：步数预算经环境变量给它（深调研默认 150 步）
+            child_env = dict(os.environ)
+            child_env["MINI_AGENT_MAX_STEPS"] = str(CHILD_MAX_STEPS)
             try:
                 proc = subprocess.Popen(
                     argv,
                     cwd=str(ctx.workdir),
+                    env=child_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -274,6 +285,14 @@ class SubagentTool(Tool):
             )
 
         final = truncate_result(parsed["final"] or "(子代理未返回文本结果)")
+        truncated_steps = _STEP_LIMIT_NOTICE in final
+        if truncated_steps:
+            # 结果不完整要显式告诉父代理（它据此缩小范围重派，而不是当作完整结论）
+            final += (
+                f"\n\n[注意] 子代理被步数上限（{CHILD_MAX_STEPS} 步）截断，以上不完整；"
+                "请把任务拆小或缩小范围后重新派发。"
+            )
         meta = {"type": "subagent", "tag": tag, "steps": parsed["assistant_count"],
-                "stop": parsed["last_stop"], "exit": proc.returncode}
+                "stop": parsed["last_stop"], "exit": proc.returncode,
+                "truncated": truncated_steps}
         return ToolOutput(final, meta)
