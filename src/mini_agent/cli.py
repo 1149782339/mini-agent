@@ -72,11 +72,13 @@ class StreamPrinter:
             print(_c(text, "dim", self.color), end="", flush=True)
         elif kind == "progress":
             # 工具参数生成心跳（大文件 Write/Edit 的 JSON 有几千 token，
-            # 流式期间终端死寂）：同行刷新，不换行
+            # 流式期间终端死寂）：同行刷新，不换行。text = "工具名 字符数"
             if self.mode != "progress":
                 self._flush()
                 self.mode = "progress"
-            print(_c(f"\r  …正在生成工具参数 {text} 字符", "dim", self.color),
+            name, _, count = text.rpartition(" ")
+            label = f" {name} 的参数" if name else "工具参数"
+            print(_c(f"\r  …正在生成{label} {count} 字符", "dim", self.color),
                   end="", flush=True)
         else:
             if self.mode != "content":

@@ -187,11 +187,15 @@ class LLM:
                             if getattr(fn, "arguments", None):
                                 slot["arguments"] += fn.arguments
                                 # 大文件 Write/Edit 的参数可能有几千 token 的 JSON，
-                                # 流式期间终端本来一片死寂——每 ~500 字符报一次进度
+                                # 流式期间终端本来一片死寂——每 ~500 字符报一次进度。
+                                # 工具名通常随首个 delta 就到，带上它让等待可辨识
                                 arg_chars = sum(len(s["arguments"]) for s in calls.values())
                                 if on_delta and arg_chars - last_progress[0] >= 500:
                                     last_progress[0] = arg_chars
-                                    on_delta("progress", str(arg_chars))
+                                    names = "+".join(
+                                        sorted({s["name"] for s in calls.values() if s["name"]})
+                                    ) or "工具"
+                                    on_delta("progress", f"{names} {arg_chars}")
             except Exception as exc:
                 raise LLMError(f"stream interrupted: {type(exc).__name__}: {exc}") from exc
 
