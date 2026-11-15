@@ -17,3 +17,4 @@ demo_data/
 
 # agent 生成的项目工作区（用户工作产物，非本仓库代码）
 cpp-archiver/
+sokoban/

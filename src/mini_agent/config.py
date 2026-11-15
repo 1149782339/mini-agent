@@ -30,7 +30,7 @@ class Config:
     model: str = "deepseek-v4.1-flash-economy"
     context_window: int = 1000000
     compact_ratio: float = 0.7
-    max_output_tokens: int = 16384
+    max_output_tokens: int = 32768
     temperature: float = 0.3
     workdir: Path = field(default_factory=lambda: Path.cwd())
     max_tool_output: int = 8000      # 单条工具结果字符上限，超出截断
