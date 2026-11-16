@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -183,6 +184,9 @@ class SubagentTool(Tool):
         "additionalProperties": False,
     }
 
+    def is_concurrency_safe(self) -> bool:
+        return True  # 子代理是独立进程天然隔离；并行派发是它的核心用法
+
     def validate_input(self, args: dict[str, Any], ctx: ToolContext) -> ValidationResult:
         prompt = args.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -204,6 +208,16 @@ class SubagentTool(Tool):
                     "snippet": snippet, "status": status, "exit": exit_code,
                 })
 
+        debug = os.environ.get("MINI_AGENT_DEBUG", "").strip() in {"1", "true"}
+        _t0 = time.monotonic()
+
+        def _dbg(marker: str) -> None:
+            if debug:
+                sys.stderr.write(
+                    f"[subagent-debug] {tag} {marker} @{time.time():.3f} "
+                    f"(+{time.monotonic() - _t0:.2f}s)\n"
+                )
+
         # system prompt 走临时文件（对齐 Pi 的 --append-system-prompt）
         tmp = tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=".md", prefix="mini_agent_sub_", delete=False
@@ -215,6 +229,7 @@ class SubagentTool(Tool):
             # 子进程是独立 load_config()：步数预算经环境变量给它（深调研默认 150 步）
             child_env = dict(os.environ)
             child_env["MINI_AGENT_MAX_STEPS"] = str(CHILD_MAX_STEPS)
+            _dbg("tmpfile-ready")
             try:
                 proc = subprocess.Popen(
                     argv,
@@ -231,8 +246,21 @@ class SubagentTool(Tool):
                 )
             except OSError as exc:
                 raise ToolError(f"无法启动子代理进程：{exc}", 20) from None
+            _dbg("popen-done")
 
             _ACTIVE_PROCS.add(proc)
+            _dbg("pre-drain")
+            # stderr 并发排空：PIPE 容量有限（Windows 64KB），子进程 stderr
+            # 写满了没进程读会整体冻死。边跑边抽干，结束时汇总
+            stderr_chunks: list[str] = []
+            if proc.stderr is not None:
+                def _drain(stream=proc.stderr, sink=stderr_chunks):
+                    for chunk in iter(stream.readline, ""):
+                        sink.append(chunk)
+                threading.Thread(target=_drain, daemon=True).start()
+
+            _report(0, 0, "子进程已启动", "running")  # 面板立刻出现，不等首个响应
+
             lines: list[str] = []
             step = 0
             tokens = 0
@@ -246,6 +274,11 @@ class SubagentTool(Tool):
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "thinking":
+                        # 长思维链期间的心跳：首个响应没完成时也有存在感
+                        chars = int(event.get("chars") or 0)
+                        _report(step, tokens, f"思考中 {chars} 字…", "running")
                         continue
                     is_step, tok, snippet = describe_event(event)
                     if is_step:
@@ -268,7 +301,7 @@ class SubagentTool(Tool):
                 raise
             finally:
                 _ACTIVE_PROCS.discard(proc)
-            err = (proc.stderr.read() if proc.stderr is not None else "") or ""
+            err = "".join(stderr_chunks)
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 

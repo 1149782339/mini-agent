@@ -186,6 +186,11 @@ def main() -> bool:
     panels.stop_all()
     check("非 TTY 更新不炸", True)
 
+    print("[回归：SubagentTool 必须声明并发安全]")
+    from mini_agent.tools.subagent import SubagentTool
+    check("Task 并发安全（否则并行派发被静默降级为串行）",
+          SubagentTool().is_concurrency_safe() is True)
+
     print("=" * 60)
     print(f"PASS {PASSED}  FAIL {FAILED}")
     if FAILURES:

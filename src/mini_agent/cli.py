@@ -178,8 +178,23 @@ def run_print_mode(args, cfg, llm=None) -> int:
             "stopReason": msg.get("_finish_reason"),
         })
 
+    # 长思维链期间的心跳：把流式 delta 节流成 thinking 事件，父面板显示
+    # "思考中 N 字…"——否则首轮长思考几十秒，子代理看起来又是死的
+    think_state = {"chars": 0, "last_emit": 0}
+
+    def _delta(kind: str, text: str) -> None:
+        if not args.json or not text:
+            return
+        think_state["chars"] += len(text)
+        if think_state["chars"] - think_state["last_emit"] >= 500:
+            think_state["last_emit"] = think_state["chars"]
+            verb = "思考中" if kind == "reasoning" else "撰写中"
+            _emit({"type": "thinking", "kind": kind,
+                   "chars": think_state["chars"], "verb": verb})
+
     if not args.json:
         _force_utf8_stdio()
+    agent.on_delta = _delta
     answer = agent.run(args.print_prompt, _event_override=_forward)
 
     if answer.startswith("ERROR:"):
