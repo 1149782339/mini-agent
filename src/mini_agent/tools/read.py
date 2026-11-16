@@ -11,7 +11,8 @@
 - 双路径读取：小文件读全文再切片；大文件流式只保留范围内行
 - 二进制 NUL 嗅探、设备文件黑名单（/dev/zero 等防挂起）、UNC 零 I/O
 
-不保留：图片/PDF/ipynb 多模态（mini-agent 是纯文本模型）。
+图片（jpg/png/gif/webp/bmp）走同一工具：魔数识别后带回图片块，不另设工具。
+PDF 和 ipynb 仍不读。
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from typing import Any
 
 from ..tokens import estimate_text_tokens
 from .base import Tool, ToolContext, ToolError, ToolOutput, ValidationResult, semantic_int
+from .image import process_image, sniff_image_mime
 from .filestate import (
     MAX_OUTPUT_SIZE,
     FileState,
@@ -52,14 +54,15 @@ _BLOCKED_DEVICES = {
 class ReadTool(Tool):
     name = "Read"
     description = (
-        "读取工作目录内的文本文件，返回 cat -n 格式内容（行号 + 制表符 + 行内容，"
-        "行号前缀不是文件内容，不要把它复制进后续编辑）。\n"
+        "读取文本文件，返回 cat -n 格式内容（行号 + 制表符 + 行内容，"
+        "行号前缀不是文件内容，不要把它复制进后续编辑）。"
+        "也读取图片（jpg、png、gif、webp、bmp），图片作为附件发给支持视觉的模型。\n"
         "用法：\n"
-        "- file_path 必填，相对工作目录或绝对路径（必须在工作目录内）。\n"
+        "- file_path 必填，相对路径基于工作目录，绝对路径任意位置均可。\n"
         "- 默认从头读最多 2000 行；长文件用 offset/limit 分段读。\n"
         "- 整读有 256KB 字节帽，超限会报错，按提示用 offset/limit 分段。\n"
         "- 同一范围重复读取会收到 file_unchanged 提示，直接引用之前的结果即可。\n"
-        "- 只能读文件；看目录请用 run_command 的 ls。"
+        "- 只能读文件；看目录请用 Ls。"
     )
     parameters = {
         "type": "object",
@@ -122,13 +125,17 @@ class ReadTool(Tool):
             limit = max(1, min(limit, 50000))
 
         if target.is_dir():
-            raise ToolError(f"这是目录不是文件：{target}。看目录请用 run_command 的 ls", 4)
+            raise ToolError(f"这是目录不是文件：{target}。看目录请用 Ls", 4)
         if not target.exists():
             hint = find_similar_file(target)
             msg = f"文件不存在：{target}"
             if hint is not None:
                 msg += f"。你是否想找 {hint}？"
             raise ToolError(msg, 3)
+
+        mime = sniff_image_mime(target)
+        if mime:
+            return self._read_image(target, mime)
 
         # 去重：仅对"模型亲眼读过"的条目（offset 非 None）且范围完全一致生效；
         # Edit/Write 回写的条目 offset=None，不参与去重（TS 侧 543-551 注释）
@@ -226,6 +233,25 @@ class ReadTool(Tool):
             ),
         )
         return ToolOutput(content, {"type": "text", "path": str(target)})
+
+    def _read_image(self, target: Path, mime: str) -> ToolOutput:
+        """图片不进读状态缓存，也不走行号视图。结果是说明文字加图片块。"""
+        try:
+            raw = target.read_bytes()
+        except OSError as exc:
+            raise ToolError(f"无法读取 {target}：{exc}", 5) from None
+        processed = process_image(raw, mime)
+        if not processed.ok:
+            note = f"Read image file [{mime}]\n{processed.message}"
+            return ToolOutput(note, {"type": "image", "path": str(target), "ok": False})
+        note = f"Read image file [{processed.mime_type}]"
+        if processed.hints:
+            note += "\n" + "\n".join(processed.hints)
+        return ToolOutput(
+            note,
+            {"type": "image", "path": str(target), "mimeType": processed.mime_type},
+            images=[{"data": processed.data, "mimeType": processed.mime_type}],
+        )
 
 
 def _stream_lines(target: Path, encoding: str, offset: int,

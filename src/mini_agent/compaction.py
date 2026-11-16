@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 
-from .tokens import message_tokens
+from .tokens import content_image_count, content_text, message_tokens
 
 # ---------- 常量（对齐 Pi 默认） ----------
 SUMMARY_TOOL_RESULT_CHARS = 2000   # 摘要输入里单条工具结果上限
@@ -74,6 +74,16 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + f" …[截断，原 {len(text)} 字符]"
 
 
+def _summary_text(content: object) -> str:
+    """摘要输入只留文字。图片用张数代替，不把 base64 送进摘要。"""
+    text = content_text(content)
+    images = content_image_count(content)
+    if not images:
+        return text
+    note = f"[{images} image(s)]"
+    return f"{text}\n{note}" if text else note
+
+
 def serialize_for_summary(messages: list[dict]) -> str:
     """把消息压成 [User]/[Assistant]/[Tool result] 标签文本（Pi serializeConversation）。
 
@@ -85,7 +95,7 @@ def serialize_for_summary(messages: list[dict]) -> str:
         if role == "system":
             continue  # system prompt 每轮都在，不进摘要输入
         if role == "user":
-            parts.append(f"[User]: {_clip(str(msg.get('content') or ''), SUMMARY_CONTENT_CHARS)}")
+            parts.append(f"[User]: {_clip(_summary_text(msg.get('content')), SUMMARY_CONTENT_CHARS)}")
         elif role == "assistant":
             calls = msg.get("tool_calls") or []
             if calls:
@@ -96,14 +106,14 @@ def serialize_for_summary(messages: list[dict]) -> str:
                         f"{fn.get('name', '?')}({_clip(fn.get('arguments', ''), 200)})"
                     )
                 parts.append(f"[Assistant tool calls]: {'; '.join(names)}")
-            content = str(msg.get("content") or "").strip()
+            content = _summary_text(msg.get("content")).strip()
             if content:
                 parts.append(f"[Assistant]: {_clip(content, SUMMARY_CONTENT_CHARS)}")
         elif role == "tool":
             call_id = msg.get("tool_call_id", "")
             parts.append(
                 f"[Tool result {call_id}]: "
-                f"{_clip(str(msg.get('content') or ''), SUMMARY_TOOL_RESULT_CHARS)}"
+                f"{_clip(_summary_text(msg.get('content')), SUMMARY_TOOL_RESULT_CHARS)}"
             )
     return "\n".join(parts)
 

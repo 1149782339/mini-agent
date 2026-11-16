@@ -7,6 +7,7 @@ from .client import ContextOverflowError, LLM, LLMError
 from .config import Config
 from .context import Context
 from .tools import ToolRegistry
+from .tools.base import ExecutedTool
 
 EventHook = Callable[[str, dict], None]
 
@@ -17,6 +18,30 @@ def _noop(event: str, payload: dict) -> None:
 
 def _call_name(call: dict) -> str:
     return call.get("function", {}).get("name", "?")
+
+
+def tool_message_content(result: ExecutedTool) -> str | list[dict]:
+    """没有图片时仍是字符串。有图片时是 text 块加 image 块，base64 不进文本截断。"""
+    images = [
+        {"type": "image", "data": img["data"], "mimeType": img["mimeType"]}
+        for img in result.images
+        if img.get("data") and img.get("mimeType")
+    ]
+    if not images:
+        return result.text
+    blocks: list[dict] = []
+    if result.text:
+        blocks.append({"type": "text", "text": result.text})
+    blocks.extend(images)
+    return blocks
+
+
+def _result_preview(result: ExecutedTool) -> str:
+    text = result.text or ""
+    if result.images:
+        extra = f"[{len(result.images)} 张图片]"
+        text = f"{text}\n{extra}" if text else extra
+    return text
 
 
 def _abort_running_children() -> None:
@@ -65,7 +90,7 @@ class Agent:
 
     # ---------- 工具批量派发（按序执行，连续的只读/Task 并行）----------
     def _dispatch_into(
-        self, calls: list[dict], truncated: bool, results: list[str | None]
+        self, calls: list[dict], truncated: bool, results: list[ExecutedTool | None]
     ) -> None:
         """按 tool_calls 顺序执行，结果写入 results 的对应下标。
 
@@ -102,14 +127,14 @@ class Agent:
             else:
                 self._dispatch_parallel(calls, idxs, results)
 
-    def _dispatch_one(self, call: dict) -> str:
-        return self.registry.dispatch(
+    def _dispatch_one(self, call: dict) -> ExecutedTool:
+        return self.registry.execute(
             _call_name(call),
             call.get("function", {}).get("arguments", "{}"),
         )
 
     def _dispatch_parallel(
-        self, calls: list[dict], idxs: list[int], results: list[str | None]
+        self, calls: list[dict], idxs: list[int], results: list[ExecutedTool | None]
     ) -> None:
         import concurrent.futures
 
@@ -134,10 +159,10 @@ class Agent:
                         pass
 
     @staticmethod
-    def _synthetic_result(name: str, truncated: bool) -> str:
+    def _synthetic_result(name: str, truncated: bool) -> ExecutedTool:
         if not truncated:
-            return f"ERROR: 未知工具 {name}"
-        return (
+            return ExecutedTool(f"ERROR: 未知工具 {name}")
+        return ExecutedTool(
             f"ERROR: {name} 的参数被输出预算截断（finish_reason=length），"
             "内容不完整，未执行。请缩小单次输出后重试：写大文件时分成多个"
             " Write（每个 ≤100 行），或减少不必要的推理长度。"
@@ -211,7 +236,7 @@ class Agent:
                     "name": _call_name(call),
                     "arguments": call.get("function", {}).get("arguments", "{}"),
                 })
-            results: list[str | None] = [None] * len(calls)
+            results: list[ExecutedTool | None] = [None] * len(calls)
             interrupted = False
             try:
                 self._dispatch_into(calls, truncated, results)
@@ -222,20 +247,21 @@ class Agent:
             for i, call in enumerate(calls):
                 if results[i] is None:
                     name = _call_name(call)
-                    results[i] = (
+                    results[i] = ExecutedTool(
                         f"ERROR: {name} 已中断，未完成" if interrupted
                         else "ERROR: 工具未返回结果"
                     )
             for call, result in zip(calls, results):
+                done = result or ExecutedTool("ERROR: 工具未返回结果")
                 on_event("tool_result", {
                     "name": _call_name(call),
-                    "result": result,
+                    "result": _result_preview(done),
                 })
                 self._add(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id", ""),
-                        "content": result,
+                        "content": tool_message_content(done),
                     }
                 )
             if interrupted:

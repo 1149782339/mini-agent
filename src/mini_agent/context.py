@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .client import LLM, LLMError, must_echo_model, request_size
-from .tokens import message_tokens
+from .tokens import content_image_count, content_text, message_tokens
 from .compaction import (
     append_file_lists,
     build_summary_prompt,
@@ -85,7 +85,7 @@ class Context:
     def _previous_summary(self) -> str:
         """从历史里取出上一份压缩摘要（迭代式摘要的"旧摘要"输入）。"""
         for msg in self.messages:
-            content = str(msg.get("content") or "")
+            content = content_text(msg.get("content"))
             if content.startswith(COMPACTION_MARKER):
                 body = content[len(COMPACTION_MARKER):]
                 parts = body.split("\n\n", 1)
@@ -233,9 +233,20 @@ class Context:
                 changed = True
             if message_tokens(msg) <= cap:
                 continue
-            content = str(msg.get("content") or "")
-            if len(content) > cap:
-                clipped = content[:cap] + f"\n…[单条消息过长已截断，原 {len(content)} 字符]"
+            content = msg.get("content")
+            text = content_text(content)
+            images = content_image_count(content)
+            # 图片按固定估算。超限时丢掉图片块，避免把 base64 截成一段残缺文本。
+            if images and message_tokens(msg) > cap:
+                note = f"{text}\n[已省略 {images} 张图片]" if text else f"[已省略 {images} 张图片]"
+                if len(note) > cap:
+                    note = note[:cap] + f"\n…[单条消息过长已截断，原 {len(text)} 字符]"
+                if note != content:
+                    msg["content"] = note
+                    changed = True
+                continue
+            if len(text) > cap:
+                clipped = text[:cap] + f"\n…[单条消息过长已截断，原 {len(text)} 字符]"
                 if clipped != content:
                     msg["content"] = clipped
                     changed = True

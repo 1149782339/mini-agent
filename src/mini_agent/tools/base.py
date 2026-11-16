@@ -93,10 +93,23 @@ class ValidationResult:
 
 @dataclass
 class ToolOutput:
-    """call() 的结构化产物；render() 把它变成发给模型的字符串。"""
+    """call() 的结构化产物；render() 把它变成发给模型的字符串。
+
+    images 是 Read 读到的图片（base64 + mime）。文本走 content，图片另存，
+    发请求时再决定是附上还是换成占位说明。
+    """
 
     text: str
     meta: dict[str, Any] = field(default_factory=dict)
+    images: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class ExecutedTool:
+    """一次派发的结果：给终端和 tool 消息的文本，以及可选的图片块。"""
+
+    text: str
+    images: list[dict[str, str]] = field(default_factory=list)
 
 
 class ToolError(Exception):
@@ -230,20 +243,24 @@ class ToolRegistry:
         )
 
     def dispatch(self, name: str, arguments: str | dict) -> str:
+        """执行工具并返回给模型看的文本。测试和只关心文本的调用用这个。"""
+        return self.execute(name, arguments).text
+
+    def execute(self, name: str, arguments: str | dict) -> ExecutedTool:
         tool = self.tools.get(name)
         if tool is None:
-            return f"ERROR: 未知工具 {name!r}，可用：{', '.join(self.names())}"
+            return ExecutedTool(f"ERROR: 未知工具 {name!r}，可用：{', '.join(self.names())}")
 
         if isinstance(arguments, str):
             try:
                 args = json.loads(arguments) if arguments.strip() else {}
             except json.JSONDecodeError as exc:
-                return f"ERROR: 参数不是合法 JSON：{exc}"
+                return ExecutedTool(f"ERROR: 参数不是合法 JSON：{exc}")
         else:
             args = arguments or {}
 
         if not isinstance(args, dict):
-            return "ERROR: 参数必须是 JSON 对象"
+            return ExecutedTool("ERROR: 参数必须是 JSON 对象")
 
         ctx = self.context or ToolContext(Path.cwd())
 
@@ -251,22 +268,22 @@ class ToolRegistry:
         checked = tool.validate_input(args, ctx)
         if not checked.ok:
             code = f" (errorCode {checked.error_code})" if checked.error_code else ""
-            return f"ERROR: {checked.message}{code}"
+            return ExecutedTool(f"ERROR: {checked.message}{code}")
 
         # 第 2 段：权限（默认 allow；deny 可直接带原因）
         decision = tool.check_permissions(args, ctx)
         if decision != "allow":
             _, _, reason = decision.partition(":")
-            return f"ERROR: 权限拒绝：{reason.strip() or name}"
+            return ExecutedTool(f"ERROR: 权限拒绝：{reason.strip() or name}")
 
         # 第 3、4 段：执行 + 序列化；异常统一转成 ERROR 字符串，不让主循环崩
         try:
             output = tool.call(args, ctx)
-            return self._truncate(tool.render(output, args))
+            return ExecutedTool(self._truncate(tool.render(output, args)), list(output.images))
         except ToolError as exc:
             code = f" (errorCode {exc.error_code})" if exc.error_code else ""
-            return f"ERROR: {exc}{code}"
+            return ExecutedTool(f"ERROR: {exc}{code}")
         except TypeError as exc:
-            return f"ERROR: 参数不匹配 {name}：{exc}"
+            return ExecutedTool(f"ERROR: 参数不匹配 {name}：{exc}")
         except Exception as exc:
-            return f"ERROR: {name} 执行失败：{type(exc).__name__}: {exc}"
+            return ExecutedTool(f"ERROR: {name} 执行失败：{type(exc).__name__}: {exc}")

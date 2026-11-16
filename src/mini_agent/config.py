@@ -40,10 +40,18 @@ class Config:
     enable_shell: bool = True        # 是否注册 run_command 工具
     shell: str = "auto"              # run_command 的 shell：auto / gitbash / cmd
     show_reasoning: bool = True      # 默认在终端打印思维链
+    vision: bool | None = None       # None 按模型名判断；True/False 为 MINI_AGENT_VISION 强制
 
     @property
     def compact_threshold(self) -> int:
         return int(self.context_window * self.compact_ratio)
+
+    @property
+    def accepts_images(self) -> bool:
+        """模型能不能看图。显式开关优先，否则看模型名。"""
+        if self.vision is not None:
+            return self.vision
+        return model_accepts_images(self.model)
 
     def validate(self) -> None:
         if not self.api_key:
@@ -51,6 +59,30 @@ class Config:
                 "缺少 API key：请设置 MINI_AGENT_API_KEY，"
                 "或在 ~/.hermes/.env 中提供 ARK_API_KEY。"
             )
+
+
+# 名字里带这些片段的模型默认可看图。
+# DeepSeek-V4.1-Flash（含经济版）另判：官方 deepseek-flash 原生多模态，
+# V4-Pro / V3 / deepseek-chat 不看图。
+_VISION_KEYS = (
+    "-vl", "vl-", "vision", "gpt-4o", "gpt-4.1", "gpt-5",
+    "gemini", "claude", "pixtral", "grok-2-vision", "grok-4",
+)
+
+
+def model_accepts_images(model: str) -> bool:
+    name = (model or "").lower()
+    if any(key in name for key in _VISION_KEYS):
+        return True
+    # 火山方舟写作 deepseek-v4.1-flash-economy，或 deepseek-v4-1-flash-economy-261017。
+    return "deepseek" in name and "flash" in name
+
+
+def _env_optional_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_config(env_file: str | Path | None = None) -> Config:
@@ -79,6 +111,7 @@ def load_config(env_file: str | Path | None = None) -> Config:
         shell=os.environ.get("MINI_AGENT_SHELL", "auto").strip().lower() or "auto",
         show_reasoning=os.environ.get("MINI_AGENT_SHOW_REASONING", "1").strip().lower()
         in {"1", "true", "yes", "on"},
+        vision=_env_optional_bool("MINI_AGENT_VISION"),
         workdir=workdir,
     )
     return cfg
@@ -95,6 +128,7 @@ FOOD_RICE
 规则：
 - 需要读写文件时调用工具，不要凭空猜测文件内容。
 - 列目录用 Ls，不要用 run_command 跑 ls。按名字找文件用 Glob，按内容找用 Grep。
+- 图片（jpg、png、gif、webp、bmp）用 Read 读取，不要用 run_command。
 - 修改已有文件前先读它；优先用 edit 做精确替换，而不是整文件重写。
 - run_command 在 Windows 上跑 Git Bash（标准 bash 语法：$VAR、; 分隔、$(...)、
   管道/重定向齐全，grep/sed/awk/find 都可用），Linux/macOS 上是 sh。

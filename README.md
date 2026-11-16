@@ -1,7 +1,7 @@
 # mini-agent
 
 一个能真跑的 Hermes 风格编码代理：工具调用闭环、上下文自动压缩、SQLite 会话。
-核心代码在 `src/mini_agent/`，约 4300 行。依赖 `openai`、`python-dotenv`、`rich`，
+核心代码在 `src/mini_agent/`，约 5100 行。依赖 `openai`、`pillow`、`python-dotenv`、`rich`，
 需要 Python ≥ 3.14，用 uv 管理（`uv run mini-agent`）。
 
 ## 快速开始
@@ -67,6 +67,9 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
   整读有 256KB 字节帽，超限报错并提示分段（报错比截断省 token）。
   单次正文再封顶 50000 字符，单行超过 2000 字符截断。同范围重复读返回
   `file_unchanged`。小文件全文读，大文件流式只留范围内行。自动识别 BOM。
+  也读图片：按文件头识别 jpg、png、gif、webp、bmp，不看扩展名。能直接放进请求的
+  原样附上，bmp 转成 png；长边超过 2000 或 base64 超过约 4.5MB 时缩小。图片不写入
+  读状态缓存，不能用来满足 Edit 的先读要求。
 - **Edit**：精确替换。修改前必须先 Read。mtime 变了先当过期；全文读过的文件
   再用内容比对排除 mtime 假阳性。`old_string` 不唯一时报错，提示加上下文或
   `replace_all`。直引号可以匹配弯引号，写回时还原原风格。按原编码和行尾写回
@@ -117,7 +120,8 @@ src/mini_agent/
 └── tools/
     ├── base.py        # 四段生命周期 + 注册表 + 输出落盘截断
     ├── filestate.py   # 读状态 LRU 缓存（read-before-write 的状态机）
-    ├── read.py        # Read
+    ├── read.py        # Read（文本 + 图片）
+    ├── image.py       # 图片魔数、缩放、bmp 转 png
     ├── edit.py        # Edit
     ├── write.py       # Write
     ├── glob_tool.py   # Glob（rg --files）
@@ -179,6 +183,7 @@ provider 返回上下文过长时，主循环强制压缩并重试这一轮恰�
 | `MINI_AGENT_BASH` | 空 | `bash.exe` 路径。也认 `GIT_BASH`。其次从 PATH 上的 `git.exe` 推导，再扫常见安装位置 |
 | `MINI_AGENT_RG_ALL` | 未设 | `1` / `true` / `yes` 时 Glob/Grep 搜索隐藏文件并忽略 `.gitignore` |
 | `MINI_AGENT_SHOW_REASONING` | `1` | `0` 关闭终端上的思维链 |
+| `MINI_AGENT_VISION` | 按模型名 | `1` 强制附图；`0` 强制不附。未设置时，DeepSeek-V4.1-Flash（含 `deepseek-v4.1-flash-economy`）以及名字里含 `vl` / `vision` / `gpt-4o` / `gpt-4.1` / `gpt-5` / `gemini` / `claude` / `pixtral` / `grok-4` 的模型附图。`deepseek-v4-pro`、`deepseek-chat` 不附 |
 | `MINI_AGENT_DB` | `<项目根>/.mini_agent/sessions.db` | 会话库路径。设置后不再做可写回退 |
 | `MINI_AGENT_DEBUG` | 未设 | `1` 或 `true` 时，子代理往 stderr 打计时 |
 
@@ -218,6 +223,7 @@ DeepSeek、Kimi、MiniMax 要求历史里的 assistant 消息带 `reasoning_cont
 
 ```bash
 uv run python examples/tool_test.py       # 离线：文件五件套 + 框架行为
+uv run python examples/image_test.py      # 离线：Read 图片、缩放、请求里附图或省略
 uv run python examples/context_test.py    # 离线：压缩管线（假 LLM）
 uv run python examples/retry_test.py      # 离线：重试分类、退避、溢出恢复（假 API）
 uv run python examples/parallel_test.py   # 离线：并行派发、按序回填、截断不派发
@@ -254,6 +260,9 @@ Glob 排序截断、字符串布尔容错。
 - 审批没有实现。`check_permissions` 只是扩展点。
 - Task 只有 single 模式：没有 parallel / chain，没有 `agents/*.md` 自定义定义。
   父终端看得到步骤级进度。Ctrl+C 会杀掉子进程。
-- Read 只处理文本，没有图片、PDF、notebook。列目录用 Ls，它只列一层。
+- Read 能读 jpg、png、gif、webp、bmp。PDF 和 notebook 仍不读。列目录用 Ls，它只列一层。
+  默认的 DeepSeek-V4.1-Flash（含经济版）会看图：这一轮工具结果后面多一条
+  user 消息，内容是 `image_url` 的 data URL。纯文本模型（如 `deepseek-v4-pro`）
+  只留文字，并换成一句不支持图片的说明。`MINI_AGENT_VISION=0` 强制不附，`1` 强制附。
 - Glob / Grep 的排除规则来自 rg（隐藏文件、`.gitignore`），没有按路径的权限规则。
 - API 重试覆盖网络抖动、限流、5xx 和流中途断开。上下文溢出自动压缩后重试一次。

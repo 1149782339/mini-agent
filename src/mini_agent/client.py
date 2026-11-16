@@ -14,10 +14,12 @@ from typing import Any, Callable
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from .config import Config
-from .tokens import count_tokens_json, estimate_text_tokens, message_tokens
+from .tokens import content_text, count_tokens_json, estimate_text_tokens, message_tokens
 
 _MUST_ECHO_KEYS = ("deepseek", "kimi", "minimax", "mimo")
 _REASONING_PAD = " "
+_TOOL_IMAGE_OMITTED = "(tool image omitted: model does not support images)"
+_ATTACHED_IMAGES = "Attached image(s) from tool result:"
 
 
 def must_echo_model(model: str) -> bool:
@@ -49,7 +51,7 @@ def _fresh_anchor(messages: list[dict]) -> tuple[int, int] | None:
     if anchor_total is None:
         return None
     for msg in messages[anchor_index + 1 :]:
-        if str(msg.get("content") or "").startswith("[COMPACTION]"):
+        if content_text(msg.get("content")).startswith("[COMPACTION]"):
             return None
     return anchor_index, anchor_total
 
@@ -104,6 +106,36 @@ def _retry_after_seconds(exc: Exception) -> float | None:
 
 def _backoff_seconds(attempt: int, exc: Exception) -> float:
     return _retry_after_seconds(exc) or min(2 ** attempt, 8) + random.uniform(0, 0.5)
+
+
+def _image_blocks(content: object) -> list[dict]:
+    if not isinstance(content, list):
+        return []
+    return [
+        block for block in content
+        if isinstance(block, dict) and block.get("type") == "image" and block.get("data")
+    ]
+
+
+def _image_urls(images: list[dict]) -> list[dict]:
+    urls = []
+    for img in images:
+        mime = img.get("mimeType") or "image/png"
+        urls.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{img['data']}"},
+        })
+    return urls
+
+
+def _tool_wire_text(content: object, images: list[dict], *, attach: bool) -> str:
+    """tool 消息发给接口时只留文字。不看图就换成占位句，看图则另附 user 消息。"""
+    text = content_text(content)
+    if images and not attach:
+        return f"{text}\n{_TOOL_IMAGE_OMITTED}" if text else _TOOL_IMAGE_OMITTED
+    if images and not text.strip():
+        return "(see attached image)"
+    return text or "(no tool output)"
 
 
 def _field(obj: Any, name: str):
@@ -169,16 +201,50 @@ class LLM:
         must-echo provider 每条 assistant 都带 reasoning_content。只有最后一条
         保留原文；更早的收成一个空格（DeepSeek V4 拒绝空字符串）。全文仍留在
         会话库里，这里只改发出去的副本。
+
+        图片块也留在会话里。tool 消息发出去时只剩文字；模型能看图时，这一批
+        工具结果后面追加一条 user 消息，用 image_url data URL 带上图片。
+        不能看图时，文字末尾换成不支持图片的说明，不附 data URL。
         """
         last = _last_assistant_index(messages)
         out: list[dict] = []
-        for i, msg in enumerate(messages):
-            clean = {k: v for k, v in msg.items() if not k.startswith("_")}
-            if self.must_echo_reasoning and clean.get("role") == "assistant":
-                if i != last or not clean.get("reasoning_content"):
-                    clean["reasoning_content"] = _REASONING_PAD
-            out.append(clean)
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") != "tool":
+                out.append(self._wire_plain(msg, i, last))
+                i += 1
+                continue
+            # 连续的 tool 结果先变成纯文本。能看图时，这一批的图片跟在后面的 user 消息里。
+            # OpenAI 的 tool 角色只能放字符串，图片不能塞进 tool content。
+            attached: list[dict] = []
+            while i < len(messages) and messages[i].get("role") == "tool":
+                clean = {k: v for k, v in messages[i].items() if not k.startswith("_")}
+                images = _image_blocks(clean.get("content"))
+                if images or isinstance(clean.get("content"), list):
+                    clean["content"] = _tool_wire_text(
+                        clean.get("content"), images, attach=self.cfg.accepts_images
+                    )
+                    if self.cfg.accepts_images:
+                        attached.extend(_image_urls(images))
+                out.append(clean)
+                i += 1
+            if attached:
+                out.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": _ATTACHED_IMAGES},
+                        *attached,
+                    ],
+                })
         return out
+
+    def _wire_plain(self, msg: dict, index: int, last: int) -> dict:
+        clean = {k: v for k, v in msg.items() if not k.startswith("_")}
+        if self.must_echo_reasoning and clean.get("role") == "assistant":
+            if index != last or not clean.get("reasoning_content"):
+                clean["reasoning_content"] = _REASONING_PAD
+        return clean
 
     def chat_stream(
         self,
