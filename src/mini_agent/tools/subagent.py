@@ -10,9 +10,10 @@
 防递归：print 模式下永不注册 Task（cli.run_print_mode 里强制摘除），
 子代理不能再派子代理。
 
-未实现（Pi 有、留待 v2）：agents/*.md frontmatter 自定义 agent 定义、
-parallel/chain 多模式、AbortSignal 细粒度中止（v1 靠 Ctrl+C kill 子进程）、
-运行中流式进度。
+步骤级进度已有：子进程 stdout 的 message_end / thinking 事件上报到父终端面板
+（步数、token、一行摘要）。未实现（Pi 有、留待 v2）：agents/*.md frontmatter
+自定义 agent 定义、parallel/chain 多模式、AbortSignal 细粒度中止
+（v1 靠 Ctrl+C kill 子进程）。
 """
 from __future__ import annotations
 
@@ -28,13 +29,14 @@ from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolContext, ToolError, ToolOutput, ValidationResult, semantic_int
+from .shell import WindowsJob, kill_process_tree
 
 # 子代理的 system prompt：明确身份、工作方式和返回格式
 CHILD_SYSTEM_PROMPT = """\
 你是一个被主代理派发的子代理，在用户的开发机上独立执行一个任务。
 
 工作方式：
-- 用 Read/Glob/Grep 了解现状，用 Edit/Write 修改文件，用 run_command 验证。
+- 用 Read/Ls/Glob/Grep 了解现状，用 Edit/Write 修改文件，用 run_command 验证。
 - 做完必须实际验证（跑测试 / 运行 / 语法检查），不要声称没做过的验证。
 - 不擅长的细节宁可再读文件确认，不要臆造路径和内容。
 
@@ -45,7 +47,7 @@ CHILD_SYSTEM_PROMPT = """\
 """
 
 # 子代理默认工具白名单（Task 已在 print 模式被摘除，双重保险不列它）
-CHILD_TOOLS = "Read,Edit,Write,Glob,Grep,run_command"
+CHILD_TOOLS = "Read,Edit,Write,Glob,Grep,Ls,run_command"
 
 MAX_RESULT_CHARS = 50000    # Pi：单任务结果 50KB 上限
 DEFAULT_TIMEOUT = 900       # 子代理最长运行秒数
@@ -55,18 +57,90 @@ CHILD_MAX_STEPS = 150       # 子代理步数预算：深调研（读十几个�
 # 子进程 stdout 里出现这个 = 子代理被步数上限截断，结果不完整
 _STEP_LIMIT_NOTICE = "达到最大工具步数"
 
-# 活跃子进程登记：主线程 KeyboardInterrupt 时统一 kill，不留孤儿
-_ACTIVE_PROCS: set[subprocess.Popen] = set()
+# 活跃子进程登记：主线程 KeyboardInterrupt 时统一 kill，不留孤儿。
+# 值是 (进程, Job)。Windows 上 Job 能带走子代理再拉起的 run_command。
+_ACTIVE_PROCS: dict[int, tuple[subprocess.Popen, object | None]] = {}
 _TAG_COUNTER = itertools.count(1)
 
 
-def terminate_active_children() -> None:
-    """杀掉所有在跑的子代理进程（loop 的 KeyboardInterrupt 路径调用）。"""
-    for proc in list(_ACTIVE_PROCS):
+class ProcessTimeout(Exception):
+    """子进程在截止时间前没有结束。"""
+
+
+def _kill_proc(proc: subprocess.Popen, job: object | None) -> None:
+    """杀掉进程以及它拉起的子孙。优先 Job Object，否则杀进程树。"""
+    try:
+        if job is not None and getattr(job, "active", False):
+            job.kill()  # type: ignore[attr-defined]
+        else:
+            kill_process_tree(proc)
+    except Exception:
         try:
             proc.kill()
         except OSError:
             pass
+    try:
+        proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def terminate_active_children() -> None:
+    """杀掉所有在跑的子代理进程（loop 的 KeyboardInterrupt 路径调用）。"""
+    for proc, job in list(_ACTIVE_PROCS.values()):
+        _kill_proc(proc, job)
+
+
+def drain_lines(stream, timeout: float, on_line) -> bool:
+    """在 timeout 秒内把流读到 EOF。
+
+    返回 True 表示读完。返回 False 表示时间到了流还没结束——调用方负责杀进程。
+    读在后台线程里进行，所以超时不依赖子进程自己关闭 stdout。
+    """
+    if stream is None:
+        return True
+    done = threading.Event()
+
+    def _reader() -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                on_line(line)
+        finally:
+            done.set()
+
+    threading.Thread(target=_reader, daemon=True).start()
+    return done.wait(timeout)
+
+
+def collect_stdout(proc: subprocess.Popen, timeout: float, on_line, job: object | None = None) -> list[str]:
+    """读完子进程 stdout。超过 timeout 秒就杀掉整棵进程树并抛 ProcessTimeout。
+
+    进程在时限内自己结束时，即使墙钟已经接近 timeout，也保留已经读到的输出。
+    """
+    lines: list[str] = []
+    deadline = time.monotonic() + timeout
+
+    def _on(line: str) -> None:
+        lines.append(line)
+        on_line(line)
+
+    try:
+        remaining = max(0.0, deadline - time.monotonic())
+        finished = drain_lines(proc.stdout, remaining, _on)
+        if not finished:
+            _kill_proc(proc, job)
+            raise ProcessTimeout()
+        if proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            try:
+                proc.wait(timeout=max(0.1, remaining))
+            except subprocess.TimeoutExpired:
+                _kill_proc(proc, job)
+                raise ProcessTimeout() from None
+    except KeyboardInterrupt:
+        _kill_proc(proc, job)
+        raise
+    return lines
 
 
 # ---------- 纯函数（可单测） ----------
@@ -230,25 +304,31 @@ class SubagentTool(Tool):
             child_env = dict(os.environ)
             child_env["MINI_AGENT_MAX_STEPS"] = str(CHILD_MAX_STEPS)
             _dbg("tmpfile-ready")
+            popen_kwargs: dict[str, Any] = dict(
+                cwd=str(ctx.workdir),
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,            # 流式逐行读需要文本模式
+                bufsize=1,
+                encoding="utf-8",
+                errors="replace",
+                # 独立进程组：POSIX 上 killpg 不会误伤父代理
+                start_new_session=True,
+            )
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             try:
-                proc = subprocess.Popen(
-                    argv,
-                    cwd=str(ctx.workdir),
-                    env=child_env,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,            # 流式逐行读需要文本模式
-                    bufsize=1,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-                )
+                proc = subprocess.Popen(argv, **popen_kwargs)
             except OSError as exc:
                 raise ToolError(f"无法启动子代理进程：{exc}", 20) from None
             _dbg("popen-done")
 
-            _ACTIVE_PROCS.add(proc)
+            job = WindowsJob() if WindowsJob is not None else None
+            if job is not None:
+                job.attach(proc)
+            _ACTIVE_PROCS[id(proc)] = (proc, job)
             _dbg("pre-drain")
             # stderr 并发排空：PIPE 容量有限（Windows 64KB），子进程 stderr
             # 写满了没进程读会整体冻死。边跑边抽干，结束时汇总
@@ -261,46 +341,39 @@ class SubagentTool(Tool):
 
             _report(0, 0, "子进程已启动", "running")  # 面板立刻出现，不等首个响应
 
-            lines: list[str] = []
             step = 0
             tokens = 0
+
+            def _on_line(line: str) -> None:
+                nonlocal step, tokens
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    return
+                if event.get("type") == "thinking":
+                    chars = int(event.get("chars") or 0)
+                    _report(step, tokens, f"思考中 {chars} 字…", "running")
+                    return
+                is_step, tok, snippet = describe_event(event)
+                if is_step:
+                    step += 1
+                    tokens = tok or tokens
+                    _report(step, tokens, snippet, "running")
+
             try:
-                # 流式读 stdout：子代理的 message_end 事件边到边解析、边上报，
-                # 父终端通过面板实时看到"第几步、多少 token、在干嘛"
-                deadline = time.monotonic() + timeout
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    lines.append(line)
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if event.get("type") == "thinking":
-                        # 长思维链期间的心跳：首个响应没完成时也有存在感
-                        chars = int(event.get("chars") or 0)
-                        _report(step, tokens, f"思考中 {chars} 字…", "running")
-                        continue
-                    is_step, tok, snippet = describe_event(event)
-                    if is_step:
-                        step += 1
-                        tokens = tok or tokens
-                        _report(step, tokens, snippet, "running")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    proc.kill()
-                    proc.communicate()
+                # 读 stdout 有截止时间：子进程不退出也会被杀掉，
+                # 而不是等它自己关闭管道之后才发现已经超时。
+                try:
+                    lines = collect_stdout(proc, timeout, _on_line, job)
+                except ProcessTimeout:
                     raise ToolError(
                         f"子代理运行超过 {timeout}s 被杀。任务太大请拆小后重试。", 21
-                    )
-                proc.wait(timeout=remaining)
+                    ) from None
                 _report(step, tokens, "", "done", proc.returncode)
-            except KeyboardInterrupt:
-                # 父代理被 Ctrl+C：连带杀掉子进程，不留孤儿
-                proc.kill()
-                proc.communicate()
-                raise
             finally:
-                _ACTIVE_PROCS.discard(proc)
+                _ACTIVE_PROCS.pop(id(proc), None)
+                if job is not None:
+                    job.close()
             err = "".join(stderr_chunks)
         finally:
             Path(tmp.name).unlink(missing_ok=True)

@@ -23,7 +23,7 @@ SUMMARY_TOOL_RESULT_CHARS = 2000   # 摘要输入里单条工具结果上限
 SUMMARY_CONTENT_CHARS = 4000       # 摘要输入里单条 user/assistant 正文上限
 FILE_LIST_CAP = 200                # 文件清单最多列多少条
 
-TOOL_NAME_READ = {"Read", "Glob", "Grep"}
+TOOL_NAME_READ = {"Read", "Glob", "Grep", "Ls"}
 TOOL_NAME_MODIFY = {"Edit", "Write"}
 
 

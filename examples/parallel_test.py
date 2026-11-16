@@ -119,9 +119,9 @@ def make_agent(llm, extra_tools: list[Tool] | None = None) -> Agent:
     return Agent(Config(workdir=workdir, enable_shell=False), reg, llm=llm)
 
 
-def batch_call(tid: str, name: str) -> dict:
+def batch_call(tid: str, name: str, arguments: str = "{}") -> dict:
     return {"id": tid, "type": "function",
-            "function": {"name": name, "arguments": "{}"}}
+            "function": {"name": name, "arguments": arguments}}
 
 
 def main() -> bool:
@@ -151,7 +151,7 @@ def main() -> bool:
     agent2.run("混合批")
     wall2 = time.monotonic() - start2
     check("不安全工具在主线程执行", SlowUnsafeTool.tid == MAIN_TID, SlowUnsafeTool.tid)
-    check("混合批总时长 < 1.2s（并行段与安全工具重叠）", wall2 < 1.2, f"{wall2:.2f}s")
+    check("混合批总时长 < 1.2s（屏障先跑完，后面的安全工具再跑）", wall2 < 1.2, f"{wall2:.2f}s")
     check("tool 顺序回填（x 前 y 后）",
           [m["tool_call_id"] for m in agent2.ctx.messages if m.get("role") == "tool"]
           == ["x", "y"])
@@ -185,6 +185,98 @@ def main() -> bool:
     panels.update({"tag": "子代理#1", "step": 1, "tokens": 100, "snippet": "x", "status": "running"})
     panels.stop_all()
     check("非 TTY 更新不炸", True)
+
+    print("[顺序：连续只读并行，屏障不提前]")
+    order: list[tuple[str, str, float]] = []
+    order_lock = threading.Lock()
+
+    def mark(phase: str, key: str) -> None:
+        with order_lock:
+            order.append((phase, key, time.monotonic()))
+
+    class OrderSafe(Tool):
+        name = "order_safe"
+        description = "可并行"
+        parameters = {"type": "object", "properties": {"k": {"type": "string"}},
+                      "required": ["k"], "additionalProperties": False}
+
+        def is_concurrency_safe(self) -> bool:
+            return True
+
+        def call(self, args, ctx) -> ToolOutput:
+            mark("start", args["k"])
+            time.sleep(0.35)
+            mark("end", args["k"])
+            return ToolOutput(args["k"])
+
+    class OrderBarrier(Tool):
+        name = "order_barrier"
+        description = "屏障"
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+        tid = None
+
+        def call(self, args, ctx) -> ToolOutput:
+            OrderBarrier.tid = threading.get_ident()
+            mark("start", "barrier")
+            time.sleep(0.2)
+            mark("end", "barrier")
+            return ToolOutput("barrier")
+
+    def stamped(phase: str, key: str) -> float:
+        return next(t for p, k, t in order if p == phase and k == key)
+
+    llm_order = ScriptLLM([
+        batch_call("a", "order_safe", '{"k": "a"}'),
+        batch_call("b", "order_safe", '{"k": "b"}'),
+        batch_call("m", "order_barrier"),
+        batch_call("c", "order_safe", '{"k": "c"}'),
+    ])
+    make_agent(llm_order, [OrderSafe(), OrderBarrier()]).run("按顺序")
+    check("a 与 b 时间重叠",
+          stamped("start", "b") < stamped("end", "a") and stamped("start", "a") < stamped("end", "b"))
+    check("屏障不早于 a、b 结束",
+          stamped("start", "barrier") >= stamped("end", "a") - 0.05
+          and stamped("start", "barrier") >= stamped("end", "b") - 0.05)
+    check("c 不早于屏障结束", stamped("start", "c") >= stamped("end", "barrier") - 0.05)
+    check("屏障在主线程", OrderBarrier.tid == MAIN_TID, OrderBarrier.tid)
+
+    print("[中断：补齐尚未回填的 tool 结果]")
+
+    class InterruptTool(Tool):
+        name = "interrupt"
+        description = "中断"
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+
+        def call(self, args, ctx) -> ToolOutput:
+            raise KeyboardInterrupt()
+
+    llm_stop = ScriptLLM([
+        batch_call("a", "slow_safe"),
+        batch_call("b", "interrupt"),
+        batch_call("c", "slow_safe"),
+    ])
+    agent_stop = make_agent(llm_stop, [SlowSafeTool(), InterruptTool()])
+    raised = False
+    try:
+        agent_stop.run("中途中断")
+    except KeyboardInterrupt:
+        raised = True
+    stopped = [m for m in agent_stop.ctx.messages if m.get("role") == "tool"]
+    check("中断继续向外抛", raised)
+    check("三个 tool_call 都有结果",
+          [m.get("tool_call_id") for m in stopped] == ["a", "b", "c"],
+          [m.get("tool_call_id") for m in stopped])
+    check("已完成的调用保留结果", stopped[0]["content"] == "safe-done", stopped[0]["content"])
+    check("未完成的调用标成中断",
+          "已中断" in stopped[1]["content"] and "已中断" in stopped[2]["content"],
+          [stopped[1]["content"], stopped[2]["content"]])
+    check("中断后配对仍然完整", not agent_stop.ctx.validate(), agent_stop.ctx.validate())
+
+    print("[写工具是屏障]")
+    from mini_agent.tools.edit import EditTool
+    from mini_agent.tools.write import WriteTool
+    check("Edit 不进并行组", EditTool().is_concurrency_safe() is False)
+    check("Write 不进并行组", WriteTool().is_concurrency_safe() is False)
 
     print("[回归：SubagentTool 必须声明并发安全]")
     from mini_agent.tools.subagent import SubagentTool

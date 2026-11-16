@@ -19,10 +19,15 @@ def estimate_text_tokens(text: str) -> int:
     return int(ascii_chars / ASCII_RATIO) + non_ascii + 1
 
 
-def message_tokens(msg: dict) -> int:
+def message_tokens(msg: dict, *, collapse_reasoning: bool = False) -> int:
     total = PER_MESSAGE_OVERHEAD
     total += estimate_text_tokens(str(msg.get("content") or ""))
-    total += estimate_text_tokens(str(msg.get("reasoning_content") or ""))
+    reasoning = str(msg.get("reasoning_content") or "")
+    if collapse_reasoning and msg.get("role") == "assistant":
+        # 发给 must-echo 端点时，非最后一条只回传一个空格
+        total += 1
+    else:
+        total += estimate_text_tokens(reasoning)
     for call in msg.get("tool_calls") or []:
         fn = call.get("function", {})
         total += estimate_text_tokens(fn.get("name", ""))

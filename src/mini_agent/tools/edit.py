@@ -129,7 +129,7 @@ class EditTool(Tool):
     }
 
     def is_concurrency_safe(self) -> bool:
-        return True  # 由 read-before-write + staleness 闸保证
+        return False  # 写文件是屏障：同一轮里必须按 tool_calls 顺序执行
 
     # ---------- 第 1 段：校验 + 预匹配（错误在写入前全部暴露） ----------
     def validate_input(self, args: dict[str, Any], ctx: ToolContext) -> ValidationResult:
@@ -197,34 +197,34 @@ class EditTool(Tool):
             raise ToolError(parsed.message, parsed.error_code)
         fctx, target, old, new, replace_all = parsed
 
-        # 临界区内再做一次 staleness 检查（TS 侧 FILE_UNEXPECTEDLY_MODIFIED_ERROR）
-        fctx.check_fresh(target)
+        # 同一路径互斥：check_fresh 到写盘必须在同一把锁里
+        with fctx.exclusive_path(target):
+            fctx.check_fresh(target)
 
-        text, encoding, eol = read_disk_text(target)
-        found = _find_actual(text, old)
-        if found is None:
-            raise ToolError("文件在校验后被修改，old_string 不再匹配，请重新 Read", 12)
-        idx, actual = found
+            text, encoding, eol = read_disk_text(target)
+            found = _find_actual(text, old)
+            if found is None:
+                raise ToolError("文件在校验后被修改，old_string 不再匹配，请重新 Read", 12)
+            idx, actual = found
 
-        new_clean = _strip_trailing_ws(new, target)
-        if actual != old:  # 弯引号路径：还原 new_string 的引号风格
-            new_clean = _restore_quotes(new_clean, actual)
+            new_clean = _strip_trailing_ws(new, target)
+            if actual != old:  # 弯引号路径：还原 new_string 的引号风格
+                new_clean = _restore_quotes(new_clean, actual)
 
-        if replace_all:
-            hits = text.count(actual)
-            new_text = text.replace(actual, new_clean)
-        else:
-            hits = 1
-            new_text = text[:idx] + new_clean + text[idx + len(actual) :]
+            if replace_all:
+                hits = text.count(actual)
+                new_text = text.replace(actual, new_clean)
+            else:
+                hits = 1
+                new_text = text[:idx] + new_clean + text[idx + len(actual) :]
 
-        # 检查到写盘之间无 I/O 间隙；写后回写读状态
-        write_disk_text(target, new_text, encoding, eol)
-        mtime = fctx.stat_mtime_ns(target)
-        fctx.state.set(
-            target,
-            FileState(content=new_text, mtime_ns=mtime, offset=None, limit=None,
-                      encoding=encoding, eol=eol),
-        )
+            write_disk_text(target, new_text, encoding, eol)
+            mtime = fctx.stat_mtime_ns(target)
+            fctx.state.set(
+                target,
+                FileState(content=new_text, mtime_ns=mtime, offset=None, limit=None,
+                          encoding=encoding, eol=eol),
+            )
 
         old_lines = len(actual.split("\n"))
         new_lines = len(new_clean.split("\n"))

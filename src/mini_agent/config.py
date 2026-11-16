@@ -33,7 +33,7 @@ class Config:
     max_output_tokens: int = 32768
     temperature: float = 0.3
     workdir: Path = field(default_factory=lambda: Path.cwd())
-    max_tool_output: int = 8000      # 单条工具结果字符上限，超出截断
+    max_tool_output: int = 80000     # 单条工具结果字符上限。高于 Read 的 50000，避免读完又被掐成头尾
     max_steps: int = 40              # 单轮最多工具循环次数（子代理经 env 提到 150）
     keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算（Pi keepRecentTokens）
     enable_subagent: bool = True    # 是否注册 Task 子代理工具（print 模式永不注册）
@@ -94,6 +94,7 @@ FOOD_RICE
 
 规则：
 - 需要读写文件时调用工具，不要凭空猜测文件内容。
+- 列目录用 Ls，不要用 run_command 跑 ls。按名字找文件用 Glob，按内容找用 Grep。
 - 修改已有文件前先读它；优先用 edit 做精确替换，而不是整文件重写。
 - run_command 在 Windows 上跑 Git Bash（标准 bash 语法：$VAR、; 分隔、$(...)、
   管道/重定向齐全，grep/sed/awk/find 都可用），Linux/macOS 上是 sh。

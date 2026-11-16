@@ -13,14 +13,15 @@
    走机械裁剪兜底（坏摘要永久污染会话比不摘要更糟）；
 5. 记账：request_size 用 usage 锚点 + 增量粗估（client.context_tokens）。
 
-未移植（见 README）：split-turn 双摘要、分支摘要、append-only 事件树投影、
-溢出自动恢复（provider 报错格式相关）。
+未移植（见 README）：split-turn 双摘要、分支摘要、append-only 事件树投影。
+上下文溢出恢复在 loop.py：provider 报窗口超限时强制压缩，并重试本轮一次。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .client import LLM, LLMError, request_size
+from .client import LLM, LLMError, must_echo_model, request_size
+from .tokens import message_tokens
 from .compaction import (
     append_file_lists,
     build_summary_prompt,
@@ -60,7 +61,11 @@ class Context:
         self.messages.append(message)
 
     def size(self, tools: list[dict] | None = None) -> int:
-        return request_size(self.messages, tools)
+        return request_size(
+            self.messages,
+            tools,
+            collapse_old_reasoning=must_echo_model(self.cfg.model),
+        )
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
@@ -137,7 +142,7 @@ class Context:
         force: bool = False,
     ) -> CompactionReport | None:
         """必要时压缩；返回报告，未压缩返回 None。force=True 时忽略阈值。"""
-        if len(self.messages) <= 2:
+        if len(self.messages) <= 1:
             return None
         if not force and not self.should_compact(tools):
             return None
@@ -146,51 +151,58 @@ class Context:
         attempts = 0
         summarised = False
         dropped = 0
-        snapshot = list(self.messages)
 
-        while attempts < max_attempts and (force or self.should_compact(tools)):
-            attempts += 1
-            cut = self._find_split(tools)
-            if cut <= 1:
-                break
-            head = self.messages[1:cut]
-            tail = self.messages[cut:]
+        # 只有 system + 一条超长消息时切点无从下手，直接截断这条。
+        if len(self.messages) <= 2:
+            if not self._shrink_oversized():
+                return None
+        else:
+            while attempts < max_attempts and (force or self.should_compact(tools)):
+                attempts += 1
+                snapshot = list(self.messages)  # 只回滚这一次，不丢掉上一轮已经成功的摘要
+                cut = self._find_split(tools)
+                if cut <= 1:
+                    if not self._shrink_oversized():
+                        break
+                    continue
+                head = self.messages[1:cut]
+                tail = self.messages[cut:]
 
-            previous = self._previous_summary()
-            read_files, modified_files = extract_file_operations(head)
-            prompt = build_summary_prompt(
-                serialize_for_summary(head),
-                previous,
-                read_files,
-                modified_files,
-            )
+                previous = self._previous_summary()
+                read_files, modified_files = extract_file_operations(head)
+                prompt = build_summary_prompt(
+                    serialize_for_summary(head),
+                    previous,
+                    read_files,
+                    modified_files,
+                )
 
-            summary_text = ""
-            try:
-                candidate = llm.summarize(prompt)
-                if looks_like_bad_summary(candidate):
-                    raise LLMError("summary rejected by quality gate")
-                # 文件清单确定性附加，不让 LLM 自由发挥路径
-                summary_text = append_file_lists(candidate, read_files, modified_files)
-                summarised = True
-            except LLMError:
                 summary_text = ""
+                try:
+                    candidate = llm.summarize(prompt)
+                    if looks_like_bad_summary(candidate):
+                        raise LLMError("summary rejected by quality gate")
+                    # 文件清单确定性附加，不让 LLM 自由发挥路径
+                    summary_text = append_file_lists(candidate, read_files, modified_files)
+                    summarised = True
+                except LLMError:
+                    summary_text = ""
 
-            if summary_text:
-                dropped += len(head)
-                self.messages = [self.messages[0], self._marker_message(summary_text), *tail]
-            else:
-                # 摘要失败：机械裁掉最老一半（保底，仍保证配对完整）
-                kept = self._mechanical_trim()
-                if kept is None:
-                    break
+                if summary_text:
+                    dropped += len(head)
+                    self.messages = [self.messages[0], self._marker_message(summary_text), *tail]
+                else:
+                    # 摘要失败：机械裁掉最老一半；裁不动就截断单条超长消息
+                    kept = self._mechanical_trim()
+                    if kept is None and not self._shrink_oversized():
+                        break
 
-            problems = self.validate(tools)
-            if problems:
-                # 校验失败：回滚本轮改动，机械裁剪一次，仍不行就放弃
-                self.messages = snapshot
-                if self._mechanical_trim() is None:
-                    break
+                problems = self.validate(tools)
+                if problems:
+                    # 校验失败：只回滚这一次，再机械裁剪；仍不行就截断超长消息
+                    self.messages = list(snapshot)
+                    if self._mechanical_trim() is None and not self._shrink_oversized():
+                        break
 
         after = self.size(tools)
         report = CompactionReport(
@@ -202,6 +214,32 @@ class Context:
         )
         self.log.append(report)
         return report
+
+    def _shrink_oversized(self) -> bool:
+        """单条消息超过窗口四分之一时，收思维链、截正文。返回是否改动了历史。
+
+        裁剪以消息为单位，一条超长 reasoning 或粘贴会让切点和机械裁剪都挪不动。
+        """
+        cap = max(1000, self.cfg.context_window // 4)
+        changed = False
+        for msg in self.messages:
+            if msg.get("role") == "system":
+                continue
+            if message_tokens(msg) <= cap:
+                continue
+            reasoning = str(msg.get("reasoning_content") or "")
+            if len(reasoning) > 1:
+                msg["reasoning_content"] = " "
+                changed = True
+            if message_tokens(msg) <= cap:
+                continue
+            content = str(msg.get("content") or "")
+            if len(content) > cap:
+                clipped = content[:cap] + f"\n…[单条消息过长已截断，原 {len(content)} 字符]"
+                if clipped != content:
+                    msg["content"] = clipped
+                    changed = True
+        return changed
 
     def _mechanical_trim(self) -> int | None:
         """机械保留较新的一半（不切 tool 消息）。返回切点；无需裁剪返回 None。"""
@@ -217,7 +255,7 @@ class Context:
     def force_fit(self, tools: list[dict] | None = None) -> None:
         """最后一道保险：反复机械裁剪直到进入窗口。"""
         guard = 0
-        while self.size(tools) > self.cfg.context_window and len(self.messages) > 2 and guard < 40:
-            if self._mechanical_trim() is None:
+        while self.size(tools) > self.cfg.context_window and len(self.messages) > 1 and guard < 40:
+            if self._mechanical_trim() is None and not self._shrink_oversized():
                 break
             guard += 1

@@ -6,7 +6,10 @@
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -17,7 +20,9 @@ from mini_agent.config import Config  # noqa: E402
 from mini_agent.tools import build_tools  # noqa: E402
 from mini_agent.tools.subagent import (  # noqa: E402
     CHILD_SYSTEM_PROMPT,
+    ProcessTimeout,
     build_child_argv,
+    collect_stdout,
     parse_json_events,
     truncate_result,
 )
@@ -87,6 +92,40 @@ def main() -> bool:
     # print 模式的防递归摘除（与 cli.run_print_mode 同款逻辑）
     reg.tools.pop("Task", None)
     check("摘除后 Task 消失", "Task" not in reg.names())
+
+    print("[stdout 超时在进程退出前生效]")
+
+    def spawn(code: str) -> subprocess.Popen:
+        kwargs: dict = dict(
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if os.name != "nt":
+            kwargs["start_new_session"] = True
+        return subprocess.Popen([sys.executable, "-c", code], **kwargs)
+
+    quick = spawn("print('hi-from-child')")
+    try:
+        got = collect_stdout(quick, 5, lambda _line: None)
+    finally:
+        if quick.poll() is None:
+            quick.kill()
+    check("时限内结束保留输出", any("hi-from-child" in line for line in got), got)
+
+    hung = spawn("import time; time.sleep(30)")
+    started = time.monotonic()
+    timed_out = False
+    try:
+        try:
+            collect_stdout(hung, 1, lambda _line: None)
+        except ProcessTimeout:
+            timed_out = True
+    finally:
+        if hung.poll() is None:
+            hung.kill()
+    elapsed = time.monotonic() - started
+    check("挂起的子进程会在超时内被杀掉", timed_out and hung.poll() is not None, hung.poll())
+    check("超时没有干等到子进程自己结束", elapsed < 8, f"{elapsed:.2f}s")
 
     print("[子代理 system prompt  sanity]")
     check("子代理 prompt 含返回格式要求", "返回格式" in CHILD_SYSTEM_PROMPT)

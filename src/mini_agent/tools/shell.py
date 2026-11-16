@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -183,6 +184,38 @@ else:
     WindowsJob = None
 
 
+# 正在跑的 shell：中断时按这张表杀整棵进程树，不留下半截命令。
+_ACTIVE_SHELLS: dict[int, tuple[subprocess.Popen, object | None]] = {}
+_SHELL_GUARD = threading.Lock()
+
+
+def register_shell(proc: subprocess.Popen, job: object | None) -> None:
+    with _SHELL_GUARD:
+        _ACTIVE_SHELLS[id(proc)] = (proc, job)
+
+
+def unregister_shell(proc: subprocess.Popen) -> None:
+    with _SHELL_GUARD:
+        _ACTIVE_SHELLS.pop(id(proc), None)
+
+
+def terminate_active_shells() -> None:
+    """杀掉所有还在跑的 run_command 进程树。"""
+    with _SHELL_GUARD:
+        items = list(_ACTIVE_SHELLS.values())
+    for proc, job in items:
+        try:
+            if job is not None and getattr(job, "active", False):
+                job.kill()  # type: ignore[attr-defined]
+            else:
+                kill_process_tree(proc)
+        except Exception:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
 def kill_process_tree(proc: subprocess.Popen) -> None:
     """兜底清理：POSIX 杀进程组；Windows 用 taskkill 再退化为 kill 子进程。
 
@@ -327,22 +360,31 @@ class ShellTools:
         job = WindowsJob() if WindowsJob is not None else None
         if job is not None:
             job.attach(proc)
+        register_shell(proc, job)
 
         timed_out = False
         try:
-            out_raw, err_raw = proc.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            if job is not None and job.active:
-                job.kill()
-            else:
-                kill_process_tree(proc)
             try:
-                out_raw, err_raw = proc.communicate(timeout=KILL_WAIT)
-            except subprocess.TimeoutExpired as exc:
-                # 极端情况：孙进程仍占着管道，放弃等待，保留已读到的输出
-                out_raw, err_raw = exc.stdout or b"", exc.stderr or b""
+                out_raw, err_raw = proc.communicate(timeout=limit)
+            except KeyboardInterrupt:
+                if job is not None and job.active:
+                    job.kill()
+                else:
+                    kill_process_tree(proc)
+                raise
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                if job is not None and job.active:
+                    job.kill()
+                else:
+                    kill_process_tree(proc)
+                try:
+                    out_raw, err_raw = proc.communicate(timeout=KILL_WAIT)
+                except subprocess.TimeoutExpired as exc:
+                    # 极端情况：孙进程仍占着管道，放弃等待，保留已读到的输出
+                    out_raw, err_raw = exc.stdout or b"", exc.stderr or b""
         finally:
+            unregister_shell(proc)
             if job is not None:
                 job.close()
 

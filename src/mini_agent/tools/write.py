@@ -48,7 +48,7 @@ class WriteTool(Tool):
     }
 
     def is_concurrency_safe(self) -> bool:
-        return True  # 覆盖保护由读状态闸承担
+        return False  # 写文件是屏障：同一轮里必须按 tool_calls 顺序执行
 
     def validate_input(self, args: dict[str, Any], ctx: ToolContext) -> ValidationResult:
         if not isinstance(ctx, FileToolContext):
@@ -76,34 +76,35 @@ class WriteTool(Tool):
         target = resolve_in_workdir(fctx.workdir, args["file_path"].strip())
         content: str = args["content"]
 
-        if target.is_dir():
-            raise ToolError(f"这是目录不是文件：{target}", 4)
-        existed = target.exists()
+        with fctx.exclusive_path(target):
+            if target.is_dir():
+                raise ToolError(f"这是目录不是文件：{target}", 4)
+            existed = target.exists()
 
-        if existed:
-            if len(content.encode("utf-8")) > MAX_FILE_BYTES:
-                raise ToolError(
-                    f"内容过大（上限 {MAX_FILE_BYTES >> 30} GiB），请分段写入", 9
-                )
-            # 覆盖保护：必须先 Read 且未过期（mtime 假阳性有内容兜底）
-            fctx.check_fresh(target)
+            if existed:
+                if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+                    raise ToolError(
+                        f"内容过大（上限 {MAX_FILE_BYTES >> 30} GiB），请分段写入", 9
+                    )
+                # 覆盖保护：必须先 Read 且未过期（mtime 假阳性有内容兜底）
+                fctx.check_fresh(target)
 
-        # 写盘：内容原样（UTF-8）；父目录自动创建（TS 侧 Write 行为）
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content.encode("utf-8"))
+            # 写盘：内容原样（UTF-8）；父目录自动创建（TS 侧 Write 行为）
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content.encode("utf-8"))
 
-        # 回写读状态：后续 Edit/再次 Write 以它为新鲜基准
-        fctx.state.set(
-            target,
-            FileState(
-                content=content.replace("\r\n", "\n"),
-                mtime_ns=fctx.stat_mtime_ns(target),
-                offset=None,
-                limit=None,
-                encoding="utf-8",
-                eol="\n",
-            ),
-        )
+            # 回写读状态：后续 Edit/再次 Write 以它为新鲜基准
+            fctx.state.set(
+                target,
+                FileState(
+                    content=content.replace("\r\n", "\n"),
+                    mtime_ns=fctx.stat_mtime_ns(target),
+                    offset=None,
+                    limit=None,
+                    encoding="utf-8",
+                    eol="\n",
+                ),
+            )
 
         lines = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         if existed:

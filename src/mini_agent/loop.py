@@ -15,6 +15,19 @@ def _noop(event: str, payload: dict) -> None:
     return None
 
 
+def _call_name(call: dict) -> str:
+    return call.get("function", {}).get("name", "?")
+
+
+def _abort_running_children() -> None:
+    """中断时杀掉还在跑的子代理和 shell，避免历史补完之后进程还活着。"""
+    from .tools.shell import terminate_active_shells
+    from .tools.subagent import terminate_active_children
+
+    terminate_active_children()
+    terminate_active_shells()
+
+
 class Agent:
     def __init__(
         self,
@@ -50,61 +63,75 @@ class Agent:
         if self.store is not None and self.session_id:
             self.store.replace(self.session_id, self.ctx.messages)
 
-    # ---------- 工具批量派发（并行执行、顺序回填）----------
-    def _dispatch_batch(self, calls: list[dict], truncated: bool) -> list[str]:
-        """把一轮的 tool_calls 并发执行，结果按 tool_calls 原顺序返回。
+    # ---------- 工具批量派发（按序执行，连续的只读/Task 并行）----------
+    def _dispatch_into(
+        self, calls: list[dict], truncated: bool, results: list[str | None]
+    ) -> None:
+        """按 tool_calls 顺序执行，结果写入 results 的对应下标。
 
-        - 模型常一次发多个调用（"并行调研两个模块"）；串行派发会把分钟级任务
-          变成两倍墙钟时间，且第二个任务的分配在第一个结束后才可见（像卡住）
-        - 并发安全分区：is_concurrency_safe()=True 的（Task/只读工具）进线程池；
-          Edit/Write 这类有副作用的留在主线程串行，避免同文件竞态
-        - API 约束：tool 消息必须按 tool_calls 数组顺序跟在 assistant 之后，
-          所以"并行执行、按序回填"；SQLite 写入（_add）也留在主线程
+        连续的 is_concurrency_safe() 工具（Read/Ls/Glob/Grep/Task）并行。
+        Edit/Write/run_command 是屏障，在主线程按原顺序执行——这样「先改文件
+        再跑测试」不会把测试跑到修改前面。中断时已完成的下标保留，其余保持 None。
         """
-        results: list[str | None] = [None] * len(calls)
-        safe_idx: list[int] = []
-        serial_idx: list[int] = []
+        groups: list[tuple[str, list[int]]] = []
+        parallel: list[int] = []
+
+        def flush() -> None:
+            nonlocal parallel
+            if parallel:
+                groups.append(("par", parallel))
+                parallel = []
+
         for i, call in enumerate(calls):
-            name = call.get("function", {}).get("name", "?")
+            name = _call_name(call)
             tool = self.registry.tools.get(name)
             if truncated or tool is None:
+                flush()
                 results[i] = self._synthetic_result(name, truncated)
-            elif tool.is_concurrency_safe():
-                safe_idx.append(i)
+                continue
+            if tool.is_concurrency_safe():
+                parallel.append(i)
             else:
-                serial_idx.append(i)
+                flush()
+                groups.append(("ser", [i]))
+        flush()
 
-        for i in serial_idx:  # 有副作用的工具：主线程串行
-            call = calls[i]
-            results[i] = self.registry.dispatch(
-                call.get("function", {}).get("name", "?"),
-                call.get("function", {}).get("arguments", "{}"),
-            )
+        for kind, idxs in groups:
+            if kind == "ser":
+                results[idxs[0]] = self._dispatch_one(calls[idxs[0]])
+            else:
+                self._dispatch_parallel(calls, idxs, results)
 
-        if safe_idx:  # 无副作用工具：并行
-            import concurrent.futures
+    def _dispatch_one(self, call: dict) -> str:
+        return self.registry.dispatch(
+            _call_name(call),
+            call.get("function", {}).get("arguments", "{}"),
+        )
 
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(4, len(safe_idx))
-            ) as pool:
-                futures = {
-                    pool.submit(
-                        self.registry.dispatch,
-                        calls[i].get("function", {}).get("name", "?"),
-                        calls[i].get("function", {}).get("arguments", "{}"),
-                    ): i
-                    for i in safe_idx
-                }
-                try:
-                    for fut in concurrent.futures.as_completed(futures):
-                        results[futures[fut]] = fut.result()
-                except KeyboardInterrupt:
-                    # 线程杀不掉，但杀掉子代理的子进程后 communicate 会返回、
-                    # 线程自然退出，不会留孤儿
-                    from .tools.subagent import terminate_active_children
-                    terminate_active_children()
-                    raise
-        return [r if r is not None else "ERROR: 工具未返回结果" for r in results]
+    def _dispatch_parallel(
+        self, calls: list[dict], idxs: list[int], results: list[str | None]
+    ) -> None:
+        import concurrent.futures
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(idxs)))
+        futures: dict = {}
+        try:
+            futures = {pool.submit(self._dispatch_one, calls[i]): i for i in idxs}
+            try:
+                for fut in concurrent.futures.as_completed(futures):
+                    results[futures[fut]] = fut.result()
+            except KeyboardInterrupt:
+                # 先杀掉子进程，worker 才能从 communicate / stdout 读里返回
+                _abort_running_children()
+                raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            for fut, i in futures.items():
+                if results[i] is None and fut.done():
+                    try:
+                        results[i] = fut.result(timeout=0)
+                    except BaseException:
+                        pass
 
     @staticmethod
     def _synthetic_result(name: str, truncated: bool) -> str:
@@ -181,13 +208,27 @@ class Agent:
             # 先一次性打印全部 tool_call 行：并行任务全部分配可见，不再像"卡住"
             for call in calls:
                 on_event("tool_call", {
-                    "name": call.get("function", {}).get("name", "?"),
+                    "name": _call_name(call),
                     "arguments": call.get("function", {}).get("arguments", "{}"),
                 })
-            results = self._dispatch_batch(calls, truncated)
+            results: list[str | None] = [None] * len(calls)
+            interrupted = False
+            try:
+                self._dispatch_into(calls, truncated, results)
+            except KeyboardInterrupt:
+                interrupted = True
+                _abort_running_children()
+            # 无论是否中断，每个 tool_call 都要有一条 tool 消息，否则下一轮 API 直接 400
+            for i, call in enumerate(calls):
+                if results[i] is None:
+                    name = _call_name(call)
+                    results[i] = (
+                        f"ERROR: {name} 已中断，未完成" if interrupted
+                        else "ERROR: 工具未返回结果"
+                    )
             for call, result in zip(calls, results):
                 on_event("tool_result", {
-                    "name": call.get("function", {}).get("name", "?"),
+                    "name": _call_name(call),
                     "result": result,
                 })
                 self._add(
@@ -197,6 +238,8 @@ class Agent:
                         "content": result,
                     }
                 )
+            if interrupted:
+                raise KeyboardInterrupt
 
         on_event("error", {"message": "达到最大工具步数"})
         return f"（达到最大工具步数 {self.cfg.max_steps}，已停止）"

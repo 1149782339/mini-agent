@@ -1,7 +1,8 @@
 """LLM 客户端：OpenAI 兼容接口，消息与工具调用统一转成纯 dict。
 
 要点：
-- 丢弃 reasoning_content（部分推理模型会返回，回传会报 400）。
+- must-echo provider（DeepSeek / Kimi / MiniMax）的 assistant 历史带回
+  reasoning_content；缺失时补一个空格（DeepSeek V4 拒绝空字符串）。
 - tool_calls 转成可序列化 dict，便于存历史。
 """
 from __future__ import annotations
@@ -13,7 +14,44 @@ from typing import Any, Callable
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from .config import Config
-from .tokens import count_tokens_json, message_tokens
+from .tokens import count_tokens_json, estimate_text_tokens, message_tokens
+
+_MUST_ECHO_KEYS = ("deepseek", "kimi", "minimax", "mimo")
+_REASONING_PAD = " "
+
+
+def must_echo_model(model: str) -> bool:
+    """这些 provider 要求 assistant 历史带非空 reasoning_content，否则 400。"""
+    name = (model or "").lower()
+    return any(k in name for k in _MUST_ECHO_KEYS)
+
+
+def _last_assistant_index(messages: list[dict]) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            return i
+    return -1
+
+
+def _fresh_anchor(messages: list[dict]) -> tuple[int, int] | None:
+    """最近一条带 usage 的 assistant。其后出现过压缩标记则锚点作废。"""
+    anchor_total: int | None = None
+    anchor_index = -1
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "assistant":
+            continue
+        usage = msg.get("_usage")
+        if isinstance(usage, dict) and usage.get("total"):
+            anchor_total = int(usage["total"])
+            anchor_index = i
+            break
+    if anchor_total is None:
+        return None
+    for msg in messages[anchor_index + 1 :]:
+        if str(msg.get("content") or "").startswith("[COMPACTION]"):
+            return None
+    return anchor_index, anchor_total
 
 
 # ---------- 错误分类与退避（API 重试） ----------
@@ -123,20 +161,22 @@ class LLM:
     @property
     def must_echo_reasoning(self) -> bool:
         """这些 provider 要求 assistant 历史带 reasoning_content，否则 400。"""
-        name = (self.cfg.model or "").lower()
-        return any(k in name for k in ("deepseek", "kimi", "minimax", "mimo"))
+        return must_echo_model(self.cfg.model)
 
     def _wire_messages(self, messages: list[dict]) -> list[dict]:
-        """发给 API 的消息：去掉私有字段；must-echo provider 每条 assistant 补 pad。
+        """发给 API 的消息：去掉私有字段。
 
-        DeepSeek V4 拒绝空字符串，所以缺失时补一个空格而不是空串。
+        must-echo provider 每条 assistant 都带 reasoning_content。只有最后一条
+        保留原文；更早的收成一个空格（DeepSeek V4 拒绝空字符串）。全文仍留在
+        会话库里，这里只改发出去的副本。
         """
+        last = _last_assistant_index(messages)
         out: list[dict] = []
-        for msg in messages:
+        for i, msg in enumerate(messages):
             clean = {k: v for k, v in msg.items() if not k.startswith("_")}
             if self.must_echo_reasoning and clean.get("role") == "assistant":
-                if not clean.get("reasoning_content"):
-                    clean["reasoning_content"] = " "
+                if i != last or not clean.get("reasoning_content"):
+                    clean["reasoning_content"] = _REASONING_PAD
             out.append(clean)
         return out
 
@@ -328,39 +368,38 @@ class LLM:
         return text
 
 
-def context_tokens(messages: list[dict]) -> int:
+def context_tokens(messages: list[dict], *, collapse_old_reasoning: bool = False) -> int:
     """Pi/Claude-Code 同款的"锚点 + 粗估"上下文记账。
 
     从后往前找最近一条带真实 usage 的 assistant 消息（私有字段 _usage，
     chat_stream 在 include_usage 时填充）：锚点 total ≈ 当时请求的 input+output，
     即当时的上下文规模；锚点之后的消息用启发式逐条估算。
-    锚点之前若发生过压缩（[COMPACTION] 标记在其后），锚点作废、全量估算——
+    锚点之后若发生过压缩（[COMPACTION] 标记），锚点作废、全量估算——
     它统计过的上下文大部分已被丢进摘要。
+
+    collapse_old_reasoning：与 _wire_messages 一致，非最后一条 assistant 的思维链
+    只计 1 token。锚点里包含的是「当时最后一条」的全文，所以只从锚点那条里扣掉
+    即将收成空格的部分，避免把上一轮已经收过的思维链再扣一次。
     """
-    anchor_total: int | None = None
-    anchor_index = -1
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if msg.get("role") == "assistant":
-            usage = msg.get("_usage")
-            if isinstance(usage, dict) and usage.get("total"):
-                anchor_total = int(usage["total"])
-                anchor_index = i
-                break
+    last = _last_assistant_index(messages)
 
-    if anchor_total is None:
-        return count_tokens(messages)
+    def tok(i: int, msg: dict) -> int:
+        collapse = collapse_old_reasoning and msg.get("role") == "assistant" and i != last
+        return message_tokens(msg, collapse_reasoning=collapse)
 
-    # 锚点之后发生过压缩 → 锚点上下文已被摘要替换，作废
-    for msg in messages[anchor_index + 1:]:
-        content = str(msg.get("content") or "")
-        if content.startswith("[COMPACTION]"):
-            return count_tokens(messages)
+    anchor = _fresh_anchor(messages)
+    if anchor is None:
+        return sum(tok(i, m) for i, m in enumerate(messages))
 
+    anchor_index, anchor_total = anchor
     total = anchor_total
-    for msg in messages[anchor_index + 1:]:
-        total += message_tokens(msg)
-    return total
+    if collapse_old_reasoning and anchor_index != last:
+        reasoning = str(messages[anchor_index].get("reasoning_content") or "")
+        if reasoning and reasoning != _REASONING_PAD:
+            total -= max(0, estimate_text_tokens(reasoning) - 1)
+    for i in range(anchor_index + 1, len(messages)):
+        total += tok(i, messages[i])
+    return max(0, total)
 
 
 def count_tokens(messages: list[dict]) -> int:
@@ -368,9 +407,18 @@ def count_tokens(messages: list[dict]) -> int:
     return sum(message_tokens(m) for m in messages)
 
 
-def request_size(messages: list[dict], tools: list[dict] | None = None) -> int:
-    """一次请求的估算 token 总量（含工具 schema）：锚点记账 + schema 估算。"""
-    total = context_tokens(messages)
-    if tools:
+def request_size(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    *,
+    collapse_old_reasoning: bool = False,
+) -> int:
+    """一次请求的估算 token 总量。
+
+    有新鲜 usage 锚点时不再加工具 schema：prompt_tokens 里已经含过。
+    没有锚点时加一次。
+    """
+    total = context_tokens(messages, collapse_old_reasoning=collapse_old_reasoning)
+    if tools and _fresh_anchor(messages) is None:
         total += count_tokens_json(tools)
     return total

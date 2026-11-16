@@ -260,6 +260,40 @@ def main() -> bool:
     r = d(reg, "Glob", pattern="*.py", path="no_such_dir")
     check("Glob 目录不存在报错", r.startswith("ERROR"), r)
 
+    # ---------- Ls ----------
+    print("[Ls]")
+    listed = SANDBOX / "ls_demo"
+    listed.mkdir()
+    (listed / "sub").mkdir()
+    (listed / "b.txt").write_text("b\n", encoding="utf-8")
+    (listed / "a.txt").write_text("a\n", encoding="utf-8")
+    (listed / ".hidden").write_text("h\n", encoding="utf-8")
+    r = d(reg, "Ls", path="ls_demo")
+    body = [ln for ln in r.splitlines() if ln and not ln.startswith("（")]
+    check("目录在前且带斜杠", body[1] == "sub/", r)
+    check("文件按名字排序", body[2:] == ["a.txt", "b.txt"], body)
+    check("默认跳过隐藏项", ".hidden" not in r and "隐藏" in r, r)
+    r = d(reg, "Ls", path="ls_demo", all="true")
+    check("all 字符串 true 显示隐藏项", ".hidden" in r, r)
+    (SANDBOX / "empty_dir").mkdir()
+    r = d(reg, "Ls", path="empty_dir")
+    check("空目录", "（空目录）" in r, r)
+    r = d(reg, "Ls", path="hello.py")
+    check("文件路径拒绝并指向 Read", r.startswith("ERROR") and "Read" in r, r)
+    r = d(reg, "Ls", path="no_such_dir_ls")
+    check("目录不存在", r.startswith("ERROR") and "不存在" in r, r)
+    r = d(reg, "Ls", path="\\\\server\\share")
+    check("Ls UNC 拒绝", r.startswith("ERROR") and "UNC" in r, r)
+    r = d(reg, "Ls", path=str(outside))
+    check("工作目录外可列", "out.txt" in r and "out2.txt" in r, r)
+    crowded = SANDBOX / "ls_many"
+    crowded.mkdir()
+    for i in range(201):
+        (crowded / f"f{i:03}.txt").write_text("x\n", encoding="utf-8")
+    r = d(reg, "Ls", path="ls_many")
+    shown = [ln for ln in r.splitlines() if ln.endswith(".txt")]
+    check("超过 200 项截断", len(shown) == 200 and "只显示前 200 项" in r, len(shown))
+
     # ---------- Grep ----------
     print("[Grep]")
     r = d(reg, "Grep", pattern="def greet")

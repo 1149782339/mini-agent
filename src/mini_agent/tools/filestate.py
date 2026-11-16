@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,7 +59,7 @@ def resolve_in_workdir(workdir: Path, raw: str) -> Path:
 def resolve_anywhere(workdir: Path, raw: str) -> Path:
     """读/搜索工具的路径解析：相对路径基于 workdir，绝对路径任意位置放行。
 
-    刻意不做范围限制——只读操作允许看机器上任何地方（Read/Glob/Grep）。
+    刻意不做范围限制——只读操作允许看机器上任何地方（Read/Ls/Glob/Grep）。
     UNC 仍由调用方在 validate 阶段拒绝（防 NTLM 凭据泄漏，与范围无关）。
     软链接照常 resolve()，读的是真实目标；写工具仍走 resolve_in_workdir。
     """
@@ -228,6 +229,21 @@ class FileToolContext(ToolContext):
         self.state = state or FileStateCache()
         self.max_read_tokens = max_read_tokens
         self.max_file_bytes = max_file_bytes
+        # 同一路径的 Edit/Write 互斥。调度器已把它们当成屏障，这把锁挡住
+        # 校验和写盘之间的窗口，避免后写完的那次盖掉前一次。
+        self._path_locks: dict[str, threading.Lock] = {}
+        self._path_locks_guard = threading.Lock()
+
+    @contextmanager
+    def exclusive_path(self, path: Path):
+        key = self.state._key(path)
+        with self._path_locks_guard:
+            lock = self._path_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._path_locks[key] = lock
+        with lock:
+            yield
 
     def stat_mtime_ns(self, path: Path) -> int:
         """mtime 用纳秒整数比对，避免 TS 侧 Math.floor(mtimeMs) 的精度坑。"""

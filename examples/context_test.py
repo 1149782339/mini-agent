@@ -11,7 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mini_agent.client import LLMError, context_tokens  # noqa: E402
+from mini_agent.client import LLM, LLMError, context_tokens, request_size  # noqa: E402
+from mini_agent.tokens import count_tokens_json  # noqa: E402
 from mini_agent.compaction import (  # noqa: E402
     append_file_lists,
     build_summary_prompt,
@@ -196,6 +197,63 @@ def main() -> bool:
     llm4 = FakeLLM(["[User]: 让我续写 " * 30])
     report4 = ctx4.compact(llm4)
     check("坏摘要被质量闸拒收", report4 is not None and not report4.summarised)
+
+    print("[第二次压缩失败不回滚第一次摘要]")
+    cfg_keep = Config(context_window=500, compact_ratio=0.9, keep_recent_tokens=100000)
+    ctx_keep = Context(cfg_keep)
+    ctx_keep.messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "原始问题MARKER"},
+        {"role": "assistant", "content": "原始回答"},
+    ]
+    good = "## Goal\nUNIQUE_SUMMARY_TOKEN " + ("进展 " * 30)
+    huge = "## Goal\n" + ("超" * 5000)
+    ctx_keep.compact(FakeLLM([good, huge]), force=True, max_attempts=2)
+    kept = "\n".join(str(m.get("content") or "") for m in ctx_keep.messages)
+    check("第一次摘要还在", "UNIQUE_SUMMARY_TOKEN" in kept, kept[:240])
+    check("没有退回压缩前的原文", "原始问题MARKER" not in kept, kept[:240])
+
+    print("[单条超长消息可截断]")
+    cfg_big = Config(context_window=4000, compact_ratio=0.5, keep_recent_tokens=20000)
+    ctx_big = Context(cfg_big)
+    ctx_big.messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "大" * 20000, "reasoning_content": "思" * 5000},
+    ]
+    report_big = ctx_big.compact(FakeLLM([]), force=True)
+    check("超长消息产生了压缩报告", report_big is not None)
+    check("思维链收成空格", ctx_big.messages[1].get("reasoning_content") == " ")
+    check("正文被截断", "已截断" in ctx_big.messages[1]["content"])
+
+    print("[request_size 不重复计算 schema / 旧思维链]")
+    tools = [{"type": "function", "function": {
+        "name": "Read", "description": "d" * 400, "parameters": {"type": "object"},
+    }}]
+    anchored_only = [
+        {"role": "system", "content": "s"},
+        {"role": "assistant", "content": "答", "_usage": {"input": 1000, "output": 50, "total": 1050}},
+    ]
+    check("有锚点不再加一遍 schema",
+          request_size(anchored_only, tools) == context_tokens(anchored_only))
+    plain = [{"role": "user", "content": "hi"}]
+    check("无锚点加一次 schema",
+          request_size(plain, tools) == context_tokens(plain) + count_tokens_json(tools))
+    long_reason = "思" * 800
+    reasoned = [
+        {"role": "system", "content": "s"},
+        {"role": "assistant", "content": "旧", "reasoning_content": long_reason,
+         "_usage": {"total": 5000, "input": 100, "output": 4900}},
+        {"role": "user", "content": "继续"},
+        {"role": "assistant", "content": "新", "reasoning_content": "短"},
+    ]
+    full = context_tokens(reasoned)
+    collapsed = context_tokens(reasoned, collapse_old_reasoning=True)
+    check("旧思维链不再按全文计入", collapsed < full - 500, f"{collapsed} vs {full}")
+    wire = LLM(Config(api_key="test", model="deepseek-v4"))._wire_messages(reasoned)
+    check("线上只保留最后一条思维链", wire[1]["reasoning_content"] == " " and wire[3]["reasoning_content"] == "短")
+    check("会话里的思维链原文还在", reasoned[1]["reasoning_content"] == long_reason)
+    other = LLM(Config(api_key="test", model="gpt-4o"))._wire_messages(reasoned)
+    check("非 must-echo 模型不改思维链", other[1]["reasoning_content"] == long_reason)
 
     print("[keep_recent_tokens 自适应]")
     small = Config(context_window=8000, compact_ratio=0.5, keep_recent_tokens=20000)

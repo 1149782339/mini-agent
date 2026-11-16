@@ -197,7 +197,7 @@ class FnTool(Tool):
 
 @dataclass
 class ToolRegistry:
-    max_output: int = 8000
+    max_output: int = 80000
     spill_dir: Path = field(default_factory=lambda: project_data_dir() / "spill")
     context: ToolContext | None = None
     tools: dict[str, Tool] = field(default_factory=dict)
