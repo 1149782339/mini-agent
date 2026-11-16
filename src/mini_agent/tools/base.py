@@ -1,17 +1,15 @@
-"""工具框架：四段生命周期 + 注册表，移植自 Claude-Code 的 Tool.ts。
+"""工具框架：四段生命周期 + 注册表。
 
-每个工具严格分四段（对应 TS 侧 ToolDef 的 validate/checkPermissions/call/
-mapToolResultToToolResultBlockParam）：
+每个工具分四段：
 
 1. validate_input(args, ctx)   纯输入校验，不做 I/O；失败信息直接反馈给模型
-2. check_permissions(args, ctx) validate 通过后才调用；mini-agent 暂无审批层，
-   默认 allow，留作扩展点（对应 TS 侧 fail-closed 的 TOOL_DEFAULTS）
+2. check_permissions(args, ctx) validate 通过后才调用；暂无审批层，
+   默认 allow，留作扩展点
 3. call(args, ctx)             真正执行，返回 ToolOutput（结构化输出）
 4. render(output, args)        把结构化输出序列化成发给模型的字符串
 
-fail-closed 默认值（TS 侧 TOOL_DEFAULTS）：is_read_only / is_concurrency_safe
-默认 False，check_permissions 默认 ask——这里权限简化为 allow/deny 字符串，
-但保持同样的"默认拒绝"语义由路径层（workdir 约束）承担。
+is_read_only / is_concurrency_safe 默认 False。权限是 allow/deny 字符串，
+路径约束在 workdir 上。
 """
 from __future__ import annotations
 
@@ -40,9 +38,9 @@ def decode_output(raw: bytes | str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-# ---------- 模型参数容错（TS 侧 semanticBoolean/semanticNumber） ----------
-# 模型偶尔把布尔/数字写成字符串："replace_all":"false"。注意不能用 Python 的
-# bool("false")——非空字符串恒为 True，正是 JS  truthiness 的同款陷阱。
+# ---------- 模型参数容错 ----------
+# 模型偶尔把布尔/数字写成字符串："replace_all":"false"。不能用 bool("false")，
+# 非空字符串恒为 True。
 
 def semantic_bool(value: Any, default: bool = False) -> bool:
     if value is None:
@@ -80,7 +78,7 @@ def semantic_int(value: Any, default: int | None = None) -> int | None:
 class ValidationResult:
     ok: bool
     message: str = ""
-    error_code: int | None = None  # TS 侧 errorCode：每个失败分支一个编号，便于定位
+    error_code: int | None = None  # 每个失败分支一个编号，便于定位
 
     @classmethod
     def pass_(cls) -> "ValidationResult":

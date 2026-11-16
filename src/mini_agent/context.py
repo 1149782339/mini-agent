@@ -1,9 +1,7 @@
-"""对话历史 + 自动压缩（context compaction），压缩管线移植自 Pi。
+"""对话历史 + 自动压缩。
 
-相比旧版（按条数切 + 自由文本摘要）的改动：
-1. 切分：token 预算制（keep_recent_tokens，Pi keepRecentTokens）——从最新往回
-   累加估算到预算即停；切点绝不切断 toolCall/toolResult 配对
-   （compaction.find_cut_point）；
+1. 切分：token 预算制（keep_recent_tokens）——从最新往回累加估算到预算即停；
+   切点绝不切断 toolCall/toolResult 配对（compaction.find_cut_point）；
 2. 摘要：输入先序列化成 [User]/[Tool result] 标签文本（防模型续写对话、
    工具结果限 2000 字符、思维链丢弃），固定 6 节结构模板；有旧摘要时走
    "更新合并"模式而非重写；
@@ -13,7 +11,6 @@
    走机械裁剪兜底（坏摘要永久污染会话比不摘要更糟）；
 5. 记账：request_size 用 usage 锚点 + 增量粗估（client.context_tokens）。
 
-未移植（见 README）：split-turn 双摘要、分支摘要、append-only 事件树投影。
 上下文溢出恢复在 loop.py：provider 报窗口超限时强制压缩，并重试本轮一次。
 """
 from __future__ import annotations
@@ -73,7 +70,7 @@ class Context:
 
     # ---------- 切分 ----------
     def _keep_tokens(self, tools: list[dict] | None = None) -> int:
-        """尾部保留预算：Pi 默认 20K；窗口很小的场景（测试/小模型）自适应收缩，
+        """尾部保留预算。窗口很小的场景（测试/小模型）自适应收缩，
         且永远不超过压缩阈值的一半，保证切完真的能降下来。"""
         threshold = self.cfg.compact_threshold
         return min(self.cfg.keep_recent_tokens, max(1000, threshold // 2))

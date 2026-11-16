@@ -1,4 +1,4 @@
-"""离线测试：移植的 Read/Edit/Write/Glob/Grep 五件套 + 工具框架。
+"""离线测试：Read/Edit/Write/Glob/Grep/Ls + 工具框架。
 
 不需要 API key，直接跑：
     uv run python examples/tool_test.py

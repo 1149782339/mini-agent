@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 
 def _read_hermes_env(key: str) -> str | None:
-    """从 Hermes 自己的 .env 里取一个与模型相关的 key，作为回退。"""
+    """从 ~/.hermes/.env 里取一个与模型相关的 key，作为回退。"""
     path = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / ".env"
     if not path.exists():
         return None
@@ -35,7 +35,7 @@ class Config:
     workdir: Path = field(default_factory=lambda: Path.cwd())
     max_tool_output: int = 80000     # 单条工具结果字符上限。高于 Read 的 50000，避免读完又被掐成头尾
     max_steps: int = 40              # 单轮最多工具循环次数（子代理经 env 提到 150）
-    keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算（Pi keepRecentTokens）
+    keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算
     enable_subagent: bool = True    # 是否注册 Task 子代理工具（print 模式永不注册）
     enable_shell: bool = True        # 是否注册 run_command 工具
     shell: str = "auto"              # run_command 的 shell：auto / gitbash / cmd

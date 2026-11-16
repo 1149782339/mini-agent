@@ -170,7 +170,7 @@ class LLM:
             "role": "assistant",
             "content": message.content or "",
         }
-        # 按 Hermes 对 must-echo provider 的处理：思维链随历史回传
+        # must-echo provider：思维链随历史回传
         reasoning = _field(message, "reasoning_content")
         if reasoning:
             out["reasoning_content"] = reasoning
@@ -264,8 +264,8 @@ class LLM:
             "messages": self._wire_messages(messages),
             "temperature": self.cfg.temperature,
             "stream": True,
-            # 让最后一个流式 chunk 带回 usage（Pi/Claude-Code 的 token 锚点记账
-            # 都靠它）；个别 OpenAI 兼容端点不认这个参数，失败时退回去重试一次
+            # 让最后一个流式 chunk 带回 usage，供锚点记账；
+            # 个别 OpenAI 兼容端点不认这个参数，失败时退回去重试一次
             "stream_options": {"include_usage": True},
         }
         if tools:
@@ -404,7 +404,7 @@ class LLM:
     def summarize(self, prompt: str) -> str:
         """执行一次摘要请求。prompt 由 compaction.build_summary_prompt 构建。
 
-        Pi 的"拒收半成品"原则：finish_reason 为 length/content_filter 或正文为空，
+        finish_reason 为 length/content_filter 或正文为空时拒收：
         一律抛 LLMError，调用方走机械裁剪兜底——坏摘要永久污染会话比不摘要更糟。
         网络类错误重试 2 次（压缩失败本来就有机械兜底，这里少重试无妨）。
         """
@@ -435,7 +435,7 @@ class LLM:
 
 
 def context_tokens(messages: list[dict], *, collapse_old_reasoning: bool = False) -> int:
-    """Pi/Claude-Code 同款的"锚点 + 粗估"上下文记账。
+    """锚点 + 粗估的上下文记账。
 
     从后往前找最近一条带真实 usage 的 assistant 消息（私有字段 _usage，
     chat_stream 在 include_usage 时填充）：锚点 total ≈ 当时请求的 input+output，

@@ -1,14 +1,11 @@
-"""Write 工具：移植自 Claude-Code FileWriteTool。
+"""Write 工具：新建或整文件覆盖。
 
-与 Edit 的分工（TS 侧 prompt）：修改已有文件优先用 Edit（只发 diff），
-Write 仅用于新建或完整重写；绝不主动建 *.md/README。
+修改已有文件优先用 Edit（只发 diff），Write 仅用于新建或完整重写。
 
-保留的机制：
 - 覆盖保护（mtime 乐观锁）：文件已存在时必须先 Read 过且未过期，
-  否则报错——校验阶段一次、写入临界区内一次（TS 侧重读检查）
+  否则报错——校验阶段一次、写入临界区内一次
 - 父目录自动创建；写后回写读状态，后续 Edit 才能工作
-- 内容原样写入（不做行尾改写；TS 侧教训：保留旧行尾曾把 bash 脚本
-  写坏），文件编码统一 UTF-8
+- 内容原样写入（不改行尾），文件编码统一 UTF-8
 """
 from __future__ import annotations
 
@@ -89,7 +86,7 @@ class WriteTool(Tool):
                 # 覆盖保护：必须先 Read 且未过期（mtime 假阳性有内容兜底）
                 fctx.check_fresh(target)
 
-            # 写盘：内容原样（UTF-8）；父目录自动创建（TS 侧 Write 行为）
+            # 写盘：内容原样（UTF-8）；父目录自动创建
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content.encode("utf-8"))
 

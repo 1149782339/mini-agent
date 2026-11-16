@@ -1,19 +1,17 @@
-"""Task 工具：子代理委派，移植自 Pi 的 subagent 扩展示例。
+"""Task 工具：子代理委派。子代理是独立进程，内核不改。
 
-架构与 Pi 一致——agent 内核零改动，子代理是**独立进程**：
 - 用 sys.executable -m mini_agent 拉起宿主自己，print 模式跑单轮任务
 - 子代理零继承父上下文：交接物只有"子代理 system prompt（临时文件）+
-  任务文本（argv 末位）"，想要多少上下文由父模型写进任务文本（显式交接）
+  任务文本（argv 末位）"，想要多少上下文由父模型写进任务文本
 - 父子通信：子进程 stdout 每行一个 JSON 事件（message_end / result / error），
   父进程取最后一条 assistant 文本作为工具结果
 
 防递归：print 模式下永不注册 Task（cli.run_print_mode 里强制摘除），
 子代理不能再派子代理。
 
-步骤级进度已有：子进程 stdout 的 message_end / thinking 事件上报到父终端面板
-（步数、token、一行摘要）。未实现（Pi 有、留待 v2）：agents/*.md frontmatter
-自定义 agent 定义、parallel/chain 多模式、AbortSignal 细粒度中止
-（v1 靠 Ctrl+C kill 子进程）。
+步骤级进度：子进程 stdout 的 message_end / thinking 事件上报到父终端面板
+（步数、token、一行摘要）。还没有 agents/*.md 自定义定义、parallel/chain，
+中止靠 Ctrl+C 杀掉子进程。
 """
 from __future__ import annotations
 
@@ -49,7 +47,7 @@ CHILD_SYSTEM_PROMPT = """\
 # 子代理默认工具白名单（Task 已在 print 模式被摘除，双重保险不列它）
 CHILD_TOOLS = "Read,Edit,Write,Glob,Grep,Ls,run_command"
 
-MAX_RESULT_CHARS = 50000    # Pi：单任务结果 50KB 上限
+MAX_RESULT_CHARS = 50000    # 单任务结果字符上限
 DEFAULT_TIMEOUT = 900       # 子代理最长运行秒数
 CHILD_MAX_STEPS = 150       # 子代理步数预算：深调研（读十几个文件）40 步不够，
                             # 进程是独立 load_config()，经环境变量覆盖给它
@@ -147,7 +145,7 @@ def collect_stdout(proc: subprocess.Popen, timeout: float, on_line, job: object 
 
 def build_child_argv(task: str, prompt_file: str, model: str = "",
                      tools: str = CHILD_TOOLS) -> list[str]:
-    """构造子进程 argv（对应 Pi index.ts:389-434 的 flag 组合）。"""
+    """构造子进程 argv。"""
     argv = [sys.executable, "-m", "mini_agent",
             "-p", task, "--json", "--no-session",
             "--append-system-prompt", prompt_file]
@@ -161,7 +159,7 @@ def build_child_argv(task: str, prompt_file: str, model: str = "",
 def parse_json_events(stdout_text: str) -> dict[str, Any]:
     """解析子进程 stdout 的 JSONL 事件流。
 
-    取最后一条 message_end 的 assistant 文本作为最终输出（Pi getFinalOutput）。
+    取最后一条 message_end 的 assistant 文本作为最终输出。
     返回 {final, assistant_count, last_stop, error, result}。
     """
     final = ""
@@ -218,7 +216,7 @@ def describe_event(event: dict[str, Any]) -> tuple[bool, int, str]:
 
 
 def truncate_result(text: str, limit: int = MAX_RESULT_CHARS) -> str:
-    """Pi truncateHead：保头、绝不在行中间切断。"""
+    """保头，绝不在行中间切断。"""
     if len(text) <= limit:
         return text
     head = text[:limit]
@@ -292,7 +290,7 @@ class SubagentTool(Tool):
                     f"(+{time.monotonic() - _t0:.2f}s)\n"
                 )
 
-        # system prompt 走临时文件（对齐 Pi 的 --append-system-prompt）
+        # system prompt 走临时文件，经 --append-system-prompt 传给子进程
         tmp = tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=".md", prefix="mini_agent_sub_", delete=False
         )

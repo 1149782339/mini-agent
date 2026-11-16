@@ -1,12 +1,10 @@
-"""Read 工具：移植自 Claude-Code FileReadTool（文本路径）。
+"""Read 工具：文本用行号视图，图片带回图片块。
 
-保留的机制：
 - cat -n 行号视图（行号 + 制表符，前缀不是文件内容）
-- offset(1 起)/limit 分页；整读字节帽 256KB，超出报错并提示分段（TS 侧
-  结论：报错比截断省 token——错误约 100 字节 vs 25K token 截断内容）
+- offset(1 起)/limit 分页；整读字节帽 256KB，超出报错并提示分段
+  （报错比截断省 token）
 - token 输出帽（粗估，超帽报错提示 offset/limit）
-- file_unchanged 去重：同范围同 mtime 直接回 stub（TS 侧数据：约 18%
-  的 Read 是重复读）
+- file_unchanged 去重：同范围同 mtime 直接回 stub
 - 读状态登记到 FileStateCache，供 Edit/Write 做 read-before-write 闸
 - 双路径读取：小文件读全文再切片；大文件流式只保留范围内行
 - 二进制 NUL 嗅探、设备文件黑名单（/dev/zero 等防挂起）、UNC 零 I/O
@@ -40,12 +38,12 @@ FILE_UNCHANGED_STUB = (
     "instead of re-reading."
 )
 
-MAX_LINES_TO_READ = 2000  # TS 侧 MAX_LINES_TO_READ（默认读取行数）
-MAX_BODY_CHARS = 50000    # Pi truncate.ts：单次输出字节帽（先到先赢）
+MAX_LINES_TO_READ = 2000  # 默认读取行数
+MAX_BODY_CHARS = 50000    # 单次输出字符帽（先到先赢）
 MAX_LINE_CHARS = 2000     # 单行截断（防 minified 行刷屏，Grep 侧还有 --max-columns 500）
-_STREAM_THRESHOLD = 10 * 1024 * 1024  # TS 侧 readFileInRange 快路径阈值
+_STREAM_THRESHOLD = 10 * 1024 * 1024  # 超过则流式只留范围内行
 
-# TS 侧 isBlockedDevicePath：会阻塞或产生无限输出的设备文件（路径黑名单，无 I/O）
+# 会阻塞或产生无限输出的设备文件（路径黑名单，无 I/O）
 _BLOCKED_DEVICES = {
     "/dev/zero", "/dev/urandom", "/dev/random", "/dev/full", "/dev/stdin",
 }
@@ -96,7 +94,6 @@ class ReadTool(Tool):
         if not isinstance(raw, str) or not raw.strip():
             return ValidationResult.fail("file_path 必须是非空字符串", error_code=1)
         if is_unc(raw.strip()):
-            # TS 侧语义：UNC 路径 defer 到授权阶段；mini-agent 没有授权层，直接拒绝
             return ValidationResult.fail(
                 f"不支持 UNC 路径 {raw!r}（防止 SMB/NTLM 凭据泄漏）", error_code=2
             )
@@ -138,7 +135,7 @@ class ReadTool(Tool):
             return self._read_image(target, mime)
 
         # 去重：仅对"模型亲眼读过"的条目（offset 非 None）且范围完全一致生效；
-        # Edit/Write 回写的条目 offset=None，不参与去重（TS 侧 543-551 注释）
+        # Edit/Write 回写的条目 offset=None，不参与去重
         existing = fctx.state.get(target)
         if (
             existing is not None
@@ -184,14 +181,14 @@ class ReadTool(Tool):
                 f"无法读取二进制文件 {target}。它是二进制文件，请用合适的工具分析。", 5
             )
 
-        # 单行截断（Pi：超长行不能整行塞给模型）
+        # 单行截断：超长行不能整行塞给模型
         chunk = [
             (ln[:MAX_LINE_CHARS] + " …[本行过长已截断]") if len(ln) > MAX_LINE_CHARS else ln
             for ln in chunk
         ]
 
         body = "\n".join(f"{i + offset:>6}\t{line}" for i, line in enumerate(chunk))
-        # 输出字节帽（Pi truncateHead：保头、绝不在行中间切断）
+        # 输出字节帽：保头，绝不在行中间切断
         if len(body) > MAX_BODY_CHARS:
             body = body[:MAX_BODY_CHARS]
             if "\n" in body:
@@ -256,7 +253,7 @@ class ReadTool(Tool):
 
 def _stream_lines(target: Path, encoding: str, offset: int,
                   limit: int | None) -> tuple[list[str], int]:
-    """流式路径（TS 侧 readFileInRange）：只保留范围内行，范围外只计数。
+    """流式路径：只保留范围内行，范围外只计数。
 
     返回 (片段行列表, 总行数)。UTF-16 逐行解码交给 io 的增量解码器。
     """
@@ -266,7 +263,7 @@ def _stream_lines(target: Path, encoding: str, offset: int,
     with open(target, "rb") as fh:
         wrapper = io.TextIOWrapper(fh, encoding=encoding, errors="replace")
         for idx, line in enumerate(wrapper, start=1):
-            total = idx  # 扫到文件尾拿真实总行数（TS 侧同样读穿整个文件）
+            total = idx  # 扫到文件尾拿真实总行数
             if idx >= offset and (stop is None or idx < stop):
                 chunk.append(line.rstrip("\r\n"))
     return chunk, total

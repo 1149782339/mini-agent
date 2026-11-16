@@ -1,6 +1,5 @@
-"""上下文压缩的纯函数组件，移植自 Pi（packages/coding-agent/src/core/compaction/）。
+"""上下文压缩的纯函数：切点、摘要序列化、文件清单、模板。
 
-设计取自 Pi 且与 mini-agent 现状对齐的部分：
 - find_cut_point：从最新往回按 token 预算找切点；绝不切断 toolCall/toolResult 配对
   （切点绝不落在 tool 消息上，也绝不把 assistant(tool_calls) 和它的结果劈开）
 - serialize_for_summary：把消息序列化成 [User]/[Assistant]/[Tool result] 标签文本
@@ -8,9 +7,6 @@
 - extract_file_operations：从工具调用参数里机械提取读过的/改过的文件清单，
   以 <read-files>/<modified-files> 确定性附加到摘要尾（LLM 摘要常丢精确路径）
 - build_summary_prompt：固定 6 节结构模板；有旧摘要时用"更新合并而非重写"模式
-
-没移植的：split-turn 双摘要（单轮就超预算时退化为整体摘要）、分支摘要、
-append-only 事件树投影（那是架构级改造，见 README）。
 """
 from __future__ import annotations
 
@@ -18,7 +14,7 @@ import json
 
 from .tokens import content_image_count, content_text, message_tokens
 
-# ---------- 常量（对齐 Pi 默认） ----------
+# ---------- 常量 ----------
 SUMMARY_TOOL_RESULT_CHARS = 2000   # 摘要输入里单条工具结果上限
 SUMMARY_CONTENT_CHARS = 4000       # 摘要输入里单条 user/assistant 正文上限
 FILE_LIST_CAP = 200                # 文件清单最多列多少条
@@ -31,7 +27,7 @@ TOOL_NAME_MODIFY = {"Edit", "Write"}
 def find_cut_point(messages: list[dict], keep_tokens: int) -> int:
     """返回切点 cut：tail = messages[cut:] 保留，head = messages[1:cut] 进摘要。
 
-    messages[0] 是 system，永不切到 0。算法（Pi findProjectedCutPoint 同款）：
+    messages[0] 是 system，永不切到 0。算法：
     从最新往回累加估算 token，达到 keep_tokens 即停；然后合法化切点——
     切点绝不落在 tool 消息上（工具结果必须跟随其 toolCall），
     也绝不把 assistant(tool_calls) 与它的 tool 结果劈开（宁可多保留往前挪）。
@@ -85,7 +81,7 @@ def _summary_text(content: object) -> str:
 
 
 def serialize_for_summary(messages: list[dict]) -> str:
-    """把消息压成 [User]/[Assistant]/[Tool result] 标签文本（Pi serializeConversation）。
+    """把消息压成 [User]/[Assistant]/[Tool result] 标签文本。
 
     思维链（reasoning_content）整体丢弃——交接不需要，还省 token。
     """
@@ -120,7 +116,7 @@ def serialize_for_summary(messages: list[dict]) -> str:
 
 # ---------- 文件清单（确定性提取，跨压缩随摘要文本累积） ----------
 def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]:
-    """从工具调用参数里提取读过的文件 / 改过的文件（Pi extractFileOperations）。
+    """从工具调用参数里提取读过的文件 / 改过的文件。
 
     只认参数（file_path/path/pattern 所在目录），解析失败跳过——
     确定性提取，不靠 LLM，保证路径精确。
@@ -182,7 +178,7 @@ def build_summary_prompt(
     read_files: list[str] | None = None,
     modified_files: list[str] | None = None,
 ) -> str:
-    """6 节结构化交接摘要 prompt（Pi 模板本地化）。文件清单确定性附加。"""
+    """6 节结构化交接摘要 prompt。文件清单确定性附加。"""
     update = ""
     if previous_summary.strip():
         update = _UPDATE_MODE_NOTE.format(previous=previous_summary.strip())
@@ -228,7 +224,7 @@ def append_file_lists(summary: str, read_files: list[str],
 
 
 def looks_like_bad_summary(text: str) -> bool:
-    """摘要质量闸（Pi getSummarizationFailure 的简化）：拒收明显坏掉的摘要。"""
+    """摘要质量闸：拒收明显坏掉的摘要。"""
     stripped = text.strip()
     if not stripped:
         return True

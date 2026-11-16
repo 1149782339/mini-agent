@@ -1,6 +1,4 @@
-"""Grep 工具：移植自 Claude-Code GrepTool。
-
-ripgrep 命令行的 1:1 映射。保留的机制：
+"""Grep 工具：ripgrep 的 content / files_with_matches / count。
 
 - output_mode: content（默认带行号）/ files_with_matches / count
 - context 参数（-B/-A/-C/context）仅 content 模式生效
@@ -12,8 +10,7 @@ ripgrep 命令行的 1:1 映射。保留的机制：
 - multiline 显式开启（-U --multiline-dotall）
 - 超时与"无匹配"区分；超时有部分结果则丢弃残缺尾行
 - 输出路径相对工作目录
-- 权限层差异：TS 侧把权限 deny 规则翻译成 rg --glob 排除；mini-agent
-  无权限层，默认靠 rg 原生忽略语义（隐藏文件/.gitignore），
+- 没有按路径的排除规则，默认靠 rg 原生忽略语义（隐藏文件/.gitignore），
   MINI_AGENT_RG_ALL=1 可反转
 """
 from __future__ import annotations
@@ -31,8 +28,8 @@ from .filestate import FileToolContext, is_unc, resolve_anywhere
 from .glob_tool import suggest_dir
 from .rg import run_rg, rg_all_flag
 
-DEFAULT_HEAD_LIMIT = 250  # TS 侧默认
-MAX_COLUMNS = 500         # TS 侧 --max-columns
+DEFAULT_HEAD_LIMIT = 250
+MAX_COLUMNS = 500         # --max-columns
 
 
 def _split_globs(raw: str) -> list[str]:
@@ -159,7 +156,7 @@ class GrepTool(Tool):
                 msg += f"。你是否想找 {hint}？"
             raise ToolError(msg, 4)
 
-        mode = args.get("output_mode") or "files_with_matches"  # TS 侧默认
+        mode = args.get("output_mode") or "files_with_matches"
         if mode not in {"content", "files_with_matches", "count"}:
             raise ToolError(
                 f"未知 output_mode {mode!r}，可用：content / files_with_matches / count", 5

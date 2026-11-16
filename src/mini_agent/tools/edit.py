@@ -1,17 +1,16 @@
-"""Edit 工具：移植自 Claude-Code FileEditTool（精确字符串替换）。
+"""Edit 工具：精确字符串替换。
 
-保留的机制：
 - read-before-write：必须先用 Read 读过该文件（FileStateCache 前置闸），
   且磁盘 mtime 未变；mtime 变化时对全文读回退比对内容（Windows 云同步/
   杀软会造成 mtime 假阳性），不一致则要求重新 Read
 - 匹配在"CRLF 归一化"后的磁盘内容上做；写盘按原编码/行尾还原
 - old_string 不唯一时报错并提示加上下文或 replace_all
-- 弯引号容错（TS 侧 preserveQuoteStyle）：old_string 里的弯引号 ' '' "
-  匹配失败后按直引号重试，命中后对 new_string 反向施加弯引号
+- 弯引号容错：old_string 里的弯引号匹配失败后按直引号重试，
+  命中后对 new_string 反向施加弯引号
 - new_string 去行尾空白；.md/.mdx 例外（行尾两空格是 Markdown 硬换行）
 - 文件大小上限 1 GiB；UNC 零 I/O；old/new 相同早退
 
-错误信息即自愈指引（TS 侧设计）：每个失败都告诉模型下一步该做什么。
+每个失败都告诉模型下一步该做什么。
 """
 from __future__ import annotations
 
@@ -32,10 +31,10 @@ from .filestate import (
     write_disk_text,
 )
 
-# TS 侧 normalizeFileEditInput：Markdown 行尾两空格是硬换行，不能剥
+# Markdown 行尾两空格是硬换行，不能剥
 _TRAILING_WS_EXEMPT = {".md", ".mdx"}
 
-# 弯引号 → 直引号（TS 侧 curly quote normalization）
+# 弯引号 → 直引号
 _QUOTE_TRANSLATION = {0x2018: "'", 0x2019: "'", 0x201C: '"', 0x201D: '"'}
 _OPENING_CONTEXT = set(" \t\n([{<—–-'\"‘’“”")
 
@@ -45,7 +44,7 @@ def _straighten(s: str) -> str:
 
 
 def _find_actual(text: str, old: str) -> tuple[int, str] | None:
-    """先精确匹配；失败则弯引号归一化后重试（TS 侧 findActualString）。
+    """先精确匹配；失败则弯引号归一化后重试。
 
     弯引号与直引号都是单字符，归一化后索引 1:1 对齐，切出原文子串返回。
     """
@@ -60,12 +59,12 @@ def _find_actual(text: str, old: str) -> tuple[int, str] | None:
 
 
 def _curly_heuristic(s: str, i: int) -> bool:
-    """引号是否为"开"：前是空白/开括号/破折号/行首视为开（TS 侧启发式）。"""
+    """引号是否为"开"：前是空白/开括号/破折号/行首视为开。"""
     return i == 0 or s[i - 1] in _OPENING_CONTEXT
 
 
 def _restore_quotes(new: str, actual_old: str) -> str:
-    """对 new_string 反向施加弯引号（TS 侧 preserveQuoteStyle）。
+    """对 new_string 反向施加弯引号。
 
     先按位置对应：old 该位置是弯引号且 new 同位置是直引号 → 换成同款弯引号；
     剩余/新增的直引号按开闭启发式配对；字母间的撇号（don't）特判为右单引号。

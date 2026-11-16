@@ -1,6 +1,6 @@
 # mini-agent
 
-一个能真跑的 Hermes 风格编码代理：工具调用闭环、上下文自动压缩、SQLite 会话。
+一个能真跑的编码代理：工具调用闭环、上下文自动压缩、SQLite 会话。
 核心代码在 `src/mini_agent/`，约 5100 行。依赖 `openai`、`pillow`、`python-dotenv`、`rich`，
 需要 Python ≥ 3.14，用 uv 管理（`uv run mini-agent`）。
 
@@ -53,7 +53,7 @@ REPL 命令：`/help` `/clear` `/compact` `/tokens` `/log` `/session` `/quit`
 
 ## 工具
 
-框架移植自 Claude Code（`Tool.ts` 的四段生命周期）。每个工具分为
+每个工具分为
 `validate_input`（纯校验、零 I/O）→ `check_permissions`（默认 allow，扩展点）
 → `call`（结构化输出）→ `render`（序列化给模型）。`is_read_only` /
 `is_concurrency_safe` 默认 false。失败信息即自愈指引，并带 errorCode。
@@ -90,7 +90,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 - **run_command**：见下方安全边界。Windows 上优先 Git Bash（`bash.exe -lc`，
   找不到则退回 cmd），POSIX 上是 `sh -c`。按 bash 语法写命令。
 
-Claude Code 用权限层做文件排除。这里没有权限层，Glob / Grep 使用 rg 默认语义
+没有权限层。Glob / Grep 使用 rg 默认语义
 （跳过隐藏文件、尊重 `.gitignore`）。`MINI_AGENT_RG_ALL=1` 改为搜索隐藏文件并忽略 gitignore。
 
 同一轮按 `tool_calls` 的顺序执行。连续的 `is_concurrency_safe()` 工具
@@ -112,7 +112,7 @@ src/mini_agent/
 ├── config.py       # 环境变量 / .env / ARK_API_KEY 回退
 ├── tokens.py       # 无依赖 token 估算（ASCII 约 3.5 字符/token，中文 1 字/token）
 ├── client.py       # OpenAI 兼容客户端；流式；usage 锚点；重试
-├── compaction.py   # 压缩纯函数：切点 / 摘要序列化 / 文件清单 / 模板（移植自 Pi）
+├── compaction.py   # 压缩纯函数：切点 / 摘要序列化 / 文件清单 / 模板
 ├── context.py      # 历史管理 + 压缩（token 预算切分 / 结构化摘要 / 质量闸 / 兜底）
 ├── store.py        # SQLite 会话持久化（sessions + messages 两表）
 ├── loop.py         # 主循环：请求 → tool_calls → 回填 → 再请求
@@ -134,7 +134,7 @@ src/mini_agent/
 
 ## 上下文压缩
 
-移植自 Pi，在每次请求前检查。
+在每次请求前检查。
 
 1. **记账**。优先用最后一条 assistant 的 `_usage.total`（流式 `include_usage`）
    当作当时的上下文规模，之后的消息按启发式增量加。锚点之后如果发生过压缩，
@@ -158,7 +158,7 @@ src/mini_agent/
 
 provider 返回上下文过长时，主循环强制压缩并重试这一轮恰好一次。
 
-未移植：split-turn 双摘要、分支摘要、append-only 事件树投影。
+还没有 split-turn 双摘要、分支摘要、append-only 事件树。
 压缩后原文不保留，只留摘要。极长会话会多次压缩，细节会丢。
 
 ## 配置

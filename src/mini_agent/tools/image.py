@@ -1,7 +1,7 @@
 """图片嗅探和缩放。Read 读到 jpg/png/gif/webp/bmp 时用这里，不另设工具。
 
-对齐 Pi 的 detectSupportedImageMimeType + processImage：魔数判断，能直接
-内联的原样保留，bmp 等先转成 png，边长超过 2000 或 base64 超过约 4.5MB 就缩小。
+魔数判断，能直接内联的原样保留，bmp 等先转成 png，
+边长超过 2000 或 base64 超过约 4.5MB 就缩小。
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def process_image(data: bytes, mime_type: str) -> ProcessedImage:
 
     working.thumbnail((MAX_EDGE, MAX_EDGE))
     # bmp 等不能直接内联的格式先转成 png。转完仍放得下就用 png，
-    # 跟 Pi 的 normalizeImage 一样；放不下再走缩小和 jpeg。
+    # 放不下再走缩小和 jpeg。
     if original_mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
         png_bytes = _save(_for_png(working), "PNG")
         if _b64_len(png_bytes) <= MAX_BASE64_CHARS:

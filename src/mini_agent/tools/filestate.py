@@ -1,13 +1,12 @@
-"""文件工具共享件：读状态缓存（TS 侧 fileStateCache.ts）+ 路径/编码工具。
+"""文件工具共享件：读状态缓存 + 路径/编码工具。
 
-readFileState 是整个文件工具族的核心状态机（一状态三用）：
+读状态是整个文件工具族的状态机（一状态三用）：
 - Read 登记读取过的内容（范围、mtime、编码、行尾）
 - Edit/Write 以它为前置条件（read-before-write），并做 staleness 闸
 - Read 自身用它做 file_unchanged 去重（同范围同 mtime 直接回 stub）
 
-编码约定（全链路 UTF-8，README 有述）：磁盘字节按 BOM 检测 utf-16-le/be，
-其余一律 UTF-8（errors=replace，不猜 GBK）；内存中文本统一 CRLF→LF，
-写盘时按文件原有行尾还原（TS 侧 writeTextContent 的 preserve 语义）。
+编码约定：磁盘字节按 BOM 检测 utf-16-le/be，其余一律 UTF-8
+（errors=replace，不猜 GBK）；内存中文本统一 CRLF→LF，写盘时按原行尾还原。
 """
 from __future__ import annotations
 
@@ -20,11 +19,11 @@ from pathlib import Path
 
 from .base import ToolContext, ToolError
 
-MAX_FILE_BYTES = 1 << 30  # Edit/Write 的防 OOM 上限（TS 侧 1 GiB cap）
-MAX_OUTPUT_SIZE = 256 * 1024  # Read 整读字节帽（TS 侧 MAX_OUTPUT_SIZE）
+MAX_FILE_BYTES = 1 << 30  # Edit/Write 的防 OOM 上限（1 GiB）
+MAX_OUTPUT_SIZE = 256 * 1024  # Read 整读字节帽
 
-CACHE_MAX_ENTRIES = 100        # TS 侧 READ_FILE_STATE_CACHE_SIZE
-CACHE_MAX_BYTES = 25 * 1024 * 1024  # TS 侧 DEFAULT_MAX_CACHE_SIZE_BYTES
+CACHE_MAX_ENTRIES = 100
+CACHE_MAX_BYTES = 25 * 1024 * 1024
 
 
 # ---------- 路径 ----------
@@ -32,7 +31,7 @@ CACHE_MAX_BYTES = 25 * 1024 * 1024  # TS 侧 DEFAULT_MAX_CACHE_SIZE_BYTES
 def is_unc(raw: str) -> bool:
     """UNC 路径（\\\\server 或 //server）。
 
-    TS 侧安全细节：对 UNC 路径跳过一切文件系统操作——Windows 的 stat/exists
+    对 UNC 路径跳过一切文件系统操作——Windows 的 stat/exists
     会触发 SMB 连接，造成 NTLM 凭据泄漏。这里只做字符串判断，零 I/O。
     """
     return raw.startswith("\\\\") or raw.startswith("//")
@@ -89,16 +88,13 @@ class FileState:
     mtime_ns: int
     offset: int | None  # Read 登记的范围；Edit/Write 回写时置 None，
     limit: int | None   # 用于区分"模型亲眼读过的"还是"工具回写的"（去重只对前者生效）
-    is_partial_view: bool = False  # partial 视图禁止 Edit/Write（TS 侧语义）
+    is_partial_view: bool = False  # partial 视图禁止 Edit/Write
     encoding: str = "utf-8"        # 磁盘编码，写回时保留
     eol: str = "\n"                # 磁盘原始行尾，写回时还原
 
 
 class FileStateCache:
-    """LRU + 总量上限的读状态缓存；键统一 normcase/normpath。
-
-    主循环单线程，不加锁（TS 侧同样假设单线程事件循环）。
-    """
+    """LRU + 总量上限的读状态缓存；键统一 normcase/normpath。"""
 
     def __init__(self, max_entries: int = CACHE_MAX_ENTRIES,
                  max_bytes: int = CACHE_MAX_BYTES):
@@ -180,8 +176,8 @@ def eol_of(text: str) -> str:
 def read_disk_text(path: Path) -> tuple[str, str, str]:
     """读盘 → (CRLF 归一化的文本, 编码, 原始行尾)。
 
-    项目约定不猜 GBK：非 BOM 文件一律 UTF-8 errors=replace（TS 侧同语义，
-    其 decode 失败按 lossy 处理而非按系统码页回退）。
+    不猜 GBK：非 BOM 文件一律 UTF-8 errors=replace，解码失败替换字符，
+    不按系统码页回退。
     """
     raw = path.read_bytes()
     if len(raw) > MAX_FILE_BYTES:
@@ -222,7 +218,7 @@ class FileToolContext(ToolContext):
         self,
         workdir: Path,
         state: FileStateCache | None = None,
-        max_read_tokens: int = 25000,   # TS 侧 DEFAULT_MAX_OUTPUT_TOKENS
+        max_read_tokens: int = 25000,
         max_file_bytes: int = MAX_OUTPUT_SIZE,
     ):
         super().__init__(workdir)
@@ -246,11 +242,11 @@ class FileToolContext(ToolContext):
             yield
 
     def stat_mtime_ns(self, path: Path) -> int:
-        """mtime 用纳秒整数比对，避免 TS 侧 Math.floor(mtimeMs) 的精度坑。"""
+        """mtime 用纳秒整数比对，避免毫秒取整的精度坑。"""
         return path.stat().st_mtime_ns
 
     def check_fresh(self, path: Path) -> FileState:
-        """staleness 双重检查（TS 侧 FileEditTool:290-311）：
+        """staleness 双重检查：
 
         磁盘 mtime 与缓存一致 → 新鲜；不一致时若缓存是全量读，回退比对
         内存内容（Windows 云同步/杀软会造成 mtime 假阳性），内容相同则

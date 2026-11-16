@@ -182,7 +182,7 @@ class Agent:
         for step in range(1, self.cfg.max_steps + 1):
             self._compact_if_needed()
 
-            # 上下文溢出（Pi 的 overflow recovery）：先压缩再重试本轮，恰好一次
+            # 上下文溢出：先压缩再重试本轮，恰好一次
             overflow_retried = False
             while True:
                 try:
@@ -226,9 +226,8 @@ class Agent:
             if not calls:
                 return response.get("content") or "(模型返回空内容)"
 
-            # Pi 的 failToolCallsFromTruncatedMessage：finish_reason=length 说明
-            # 思维链吃光了输出预算、工具参数被截断（残缺 JSON 能解析但 silently
-            # 不完整，执行了更糟）。不派发，直接回合成错误让模型缩小输出重试。
+            # finish_reason=length 说明思维链吃光了输出预算、工具参数被截断
+            # （残缺 JSON 能解析但不完整，执行了更糟）。不派发，回合成错误让模型缩小输出重试。
             truncated = response.get("_finish_reason") == "length"
             # 先一次性打印全部 tool_call 行：并行任务全部分配可见，不再像"卡住"
             for call in calls:

@@ -43,8 +43,8 @@ def _c(text: str, color: str, enabled: bool = True) -> str:
 class SubagentPanels:
     """rich.Live 底部状态区：每个活跃子代理一块，原地刷新各自的最新输出。
 
-    解决"并行子代理进度交错刷屏"——业界（Claude Code 的 TUI）用多面板各自
-    独立更新，我们 REPL 仍是行打印主体，只在底部开一个 transient 状态区：
+    并行子代理的进度各自一块、原地刷新，避免交错刷屏。
+    REPL 仍是行打印主体，只在底部开一个 transient 状态区：
     子代理全部结束后面板自动消失，最终 tool_result 行照常打印在上方。
     非 TTY（管道/重定向）自动禁用。
     """
@@ -425,7 +425,7 @@ def main() -> None:
             print(answer)
         print()
 
-    # Claude Code 同款退出提示：告诉用户怎么恢复本次会话
+    # 告诉用户怎么恢复本次会话
     printer.panels.stop_all()
     print()
     print(_c("Resume this session with:", "dim", color))

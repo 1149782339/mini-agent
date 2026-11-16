@@ -52,7 +52,7 @@ def find_git_bash() -> Path | None:
         return candidate if candidate.is_file() else None
 
     # 跟着 PATH 上的 git.exe 推导 bash.exe：官方安装布局（cmd\bin\git.exe）
-    # 下都成立，绿色安装/自定义路径也能找到。借自 Claude Code 的 findGitBashPath
+    # 下都成立，绿色安装/自定义路径也能找到。
     git = shutil.which("git")
     if git:
         candidate = (Path(git) / ".." / ".." / "bin" / "bash.exe").resolve()
@@ -76,9 +76,9 @@ def find_git_bash() -> Path | None:
 
 
 # 模型偶发 cmd 习惯的 `2>nul`：Git Bash 会创建字面文件 nul（Windows 保留设备名，
-# 极难删除且搞坏 git add/clone，见 anthropics/claude-code#4928）。统一改写成
-# /dev/null。正则借自 Claude Code：匹配 `>nul` `2>nul` `&>nul` `>>nul`（大小写
-# 不敏感），不匹配 `>null` `>nul.txt`；不解析引号，`echo ">nul"` 会被误改但无害。
+# 极难删除且搞坏 git add/clone）。统一改写成 /dev/null。匹配 `>nul` `2>nul`
+# `&>nul` `>>nul`（大小写不敏感），不匹配 `>null` `>nul.txt`；不解析引号，
+# `echo ">nul"` 会被误改但无害。
 _NUL_REDIRECT_RE = re.compile(r"(\d?&?>+\s*)[Nn][Uu][Ll](?=\s|$|[|&;)\n])")
 
 
@@ -302,7 +302,7 @@ class ShellTools:
         return target
 
     def _clip(self, text: str, tag: str = "out") -> str:
-        """超长输出：完整内容落盘 spill/，上下文里只保留末尾（Pi truncateTail）。
+        """超长输出：完整内容落盘 spill/，上下文里只保留末尾。
 
         保尾不保头——错误信息几乎总在输出末尾，旧版保头会把关键报错剪掉。
         """
@@ -354,7 +354,7 @@ class ShellTools:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
-            # 等价 Claude Code 的 windowsHide：子进程不新建控制台窗口
+            # 子进程不新建控制台窗口
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         job = WindowsJob() if WindowsJob is not None else None

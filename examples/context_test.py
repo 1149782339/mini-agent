@@ -1,4 +1,4 @@
-"""离线测试：Pi 移植的上下文管理机制（切点/序列化/文件清单/摘要/锚点记账）。
+"""离线测试：上下文管理（切点/序列化/文件清单/摘要/锚点记账）。
 
 不需要 API key：LLM 用假实现（只实现 summarize 接口）。
     uv run python examples/context_test.py

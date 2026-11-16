@@ -1,14 +1,14 @@
-"""Glob 工具：移植自 Claude-Code GlobTool。
+"""Glob 工具：按文件名找文件。
 
 底层是 `rg --files --glob pattern --sort=modified`（不是 Python glob），
-免费获得 .gitignore 语义和仓库级性能。保留的机制：
+带 .gitignore 语义。
 
 - 结果按修改时间排序（最新在前），截断 100 条并给出 truncated 提示
 - 输出路径相对工作目录，省 token
 - 超时与"无匹配"区分；超时有部分结果则丢弃残缺尾行后返回
 - ENOENT 时 "Did you mean X?" 建议
 - 忽略语义：默认 rg 原生（跳过隐藏文件 + 尊重 .gitignore）；
-  MINI_AGENT_RG_ALL=1 可切换为 --hidden --no-ignore（TS 侧默认）
+  MINI_AGENT_RG_ALL=1 可切换为 --hidden --no-ignore
 """
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from .base import Tool, ToolContext, ToolError, ToolOutput, ValidationResult
 from .filestate import FileToolContext, is_unc, resolve_anywhere
 from .rg import run_rg, rg_all_flag
 
-LIMIT = 100          # TS 侧 GlobTool 默认截断条数
-TIMEOUT = 20         # TS 侧 CLAUDE_CODE_GLOB_TIMEOUT_SECONDS 默认 20s
+LIMIT = 100          # 截断条数
+TIMEOUT = 20         # 秒
 
 
 class GlobTool(Tool):
