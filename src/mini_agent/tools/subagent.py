@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolContext, ToolError, ToolOutput, ValidationResult, semantic_int
+from ..envutil import sanitize_subprocess_env
 from .shell import WindowsJob, kill_process_tree
 
 # 子代理的 system prompt：明确身份、工作方式和返回格式
@@ -154,6 +155,21 @@ def build_child_argv(task: str, prompt_file: str, model: str = "",
     if model.strip():
         argv += ["--model", model.strip()]
     return argv
+
+
+def build_child_env(
+    base: dict[str, str] | None = None,
+    max_steps: int = CHILD_MAX_STEPS,
+) -> dict[str, str]:
+    """构造子代理进程的环境。
+
+    剥离父进程里的 API key 等密钥。子进程启动时由 load_config() 自行从
+    项目 .env 或 ~/.hermes/.env 读取密钥，不靠继承父进程环境。
+    MINI_AGENT_MAX_STEPS 仍由父进程显式写入，覆盖子代理步数预算。
+    """
+    env = sanitize_subprocess_env(base)
+    env["MINI_AGENT_MAX_STEPS"] = str(max_steps)
+    return env
 
 
 def parse_json_events(stdout_text: str) -> dict[str, Any]:
@@ -298,9 +314,9 @@ class SubagentTool(Tool):
             tmp.write(CHILD_SYSTEM_PROMPT)
             tmp.close()
             argv = build_child_argv(task, tmp.name)
-            # 子进程是独立 load_config()：步数预算经环境变量给它（深调研默认 150 步）
-            child_env = dict(os.environ)
-            child_env["MINI_AGENT_MAX_STEPS"] = str(CHILD_MAX_STEPS)
+            # 子进程是独立 load_config()：步数预算经环境变量给它（深调研默认 150 步）。
+            # 密钥不从父进程环境继承，由子进程自己读项目 .env / ~/.hermes/.env。
+            child_env = build_child_env(os.environ, CHILD_MAX_STEPS)
             _dbg("tmpfile-ready")
             popen_kwargs: dict[str, Any] = dict(
                 cwd=str(ctx.workdir),

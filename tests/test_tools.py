@@ -1,7 +1,7 @@
 """离线测试：Read/Edit/Write/Glob/Grep/Ls + 工具框架。
 
 不需要 API key，直接跑：
-    uv run python examples/tool_test.py
+    uv run pytest
 覆盖：read-before-write、staleness 闸（含 mtime 假阳性内容兜底）、
 CRLF/UTF-16 保真、弯引号容错、file_unchanged 去重、分页、二进制/UNC/
 越界拒绝、Grep 三种模式与翻页、Glob 排序与截断、semantic_bool 容错。
@@ -9,32 +9,23 @@ CRLF/UTF-16 保真、弯引号容错、file_unchanged 去重、分页、二进�
 from __future__ import annotations
 
 import json
+import os
 import shutil
-import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from mini_agent.config import Config  # noqa: E402
 from mini_agent.tools import build_tools  # noqa: E402
 
 SANDBOX = ROOT / "sandbox" / "tool_test"
 
-PASSED = FAILED = 0
-FAILURES: list[str] = []
 
 
-def check(name: str, cond: bool, detail: str = ""):
-    global PASSED, FAILED
-    if cond:
-        PASSED += 1
-        print(f"  ok  {name}")
-    else:
-        FAILED += 1
-        FAILURES.append(name)
-        print(f"  FAIL {name}  {detail}")
+def check(name: str, cond: bool, detail: str = "") -> None:
+    assert cond, f"{name}  {detail}"
+
 
 
 def make_registry():
@@ -46,7 +37,7 @@ def d(reg, name, **kw) -> str:
     return reg.dispatch(name, json.dumps(kw, ensure_ascii=False))
 
 
-def main() -> bool:
+def test_tools_suite() -> None:
     shutil.rmtree(SANDBOX, ignore_errors=True)
     SANDBOX.mkdir(parents=True)
     reg = make_registry()
@@ -244,10 +235,14 @@ def main() -> bool:
     # ---------- Glob ----------
     print("[Glob]")
     (SANDBOX / "pkg").mkdir(exist_ok=True)
+    base = time.time() - 200
     for i in range(120):
-        (SANDBOX / "pkg" / f"m{i:03}.py").write_text(f"# {i}\n", encoding="utf-8")
-    time.sleep(0.02)
-    (SANDBOX / "pkg" / "newest.py").write_text("# newest\n", encoding="utf-8")
+        path = SANDBOX / "pkg" / f"m{i:03}.py"
+        path.write_text(f"# {i}\n", encoding="utf-8")
+        os.utime(path, (base + i, base + i))
+    newest = SANDBOX / "pkg" / "newest.py"
+    newest.write_text("# newest\n", encoding="utf-8")
+    os.utime(newest, (base + 1000, base + 1000))
     r = d(reg, "Glob", pattern="**/*.py", path="pkg")
     lines = [ln for ln in r.split("\n") if ln.strip()]
     path_lines = [ln for ln in lines if not ln.startswith("（")]
@@ -331,12 +326,4 @@ def main() -> bool:
     r = d(flow, "Read", file_path="app.py")
     check("写→读→改→读 闭环", "print('ok')" in r, r)
 
-    print("=" * 60)
-    print(f"PASS {PASSED}  FAIL {FAILED}")
-    if FAILURES:
-        print("失败用例:", ", ".join(FAILURES))
-    return FAILED == 0
 
-
-if __name__ == "__main__":
-    sys.exit(0 if main() else 1)

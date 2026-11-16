@@ -4,17 +4,15 @@
 覆盖：安全工具真并行（墙钟时间）、结果按 tool_calls 顺序回填、
 Edit/Write 类不安全工具留主线程串行、截断调用零派发、
 进度事件 describe_event 提取、非 TTY 面板静默降级。
-    uv run python examples/parallel_test.py
+    uv run pytest
 """
 from __future__ import annotations
 
-import sys
 import threading
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from mini_agent.config import Config  # noqa: E402
 from mini_agent.loop import Agent  # noqa: E402
@@ -22,22 +20,13 @@ from mini_agent.tools import ToolRegistry, build_tools  # noqa: E402
 from mini_agent.tools.base import Tool, ToolContext, ToolOutput  # noqa: E402
 from mini_agent.tools.subagent import describe_event  # noqa: E402
 
-PASSED = FAILED = 0
-FAILURES: list[str] = []
-
-
-def check(name: str, cond: bool, detail: str = ""):
-    global PASSED, FAILED
-    if cond:
-        PASSED += 1
-        print(f"  ok  {name}")
-    else:
-        FAILED += 1
-        FAILURES.append(name)
-        print(f"  FAIL {name}  {detail}")
-
-
 MAIN_TID = threading.get_ident()
+
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    assert cond, f"{name}  {detail}"
+
 
 
 class SlowSafeTool(Tool):
@@ -124,7 +113,7 @@ def batch_call(tid: str, name: str, arguments: str = "{}") -> dict:
             "function": {"name": name, "arguments": arguments}}
 
 
-def main() -> bool:
+def test_parallel_suite() -> None:
     print("[真并行：同一安全工具被并发调两次]")
     SlowSafeTool.tids.clear()
     llm = ScriptLLM([batch_call("a", "slow_safe"), batch_call("b", "slow_safe")])
@@ -283,12 +272,4 @@ def main() -> bool:
     check("Task 并发安全（否则并行派发被静默降级为串行）",
           SubagentTool().is_concurrency_safe() is True)
 
-    print("=" * 60)
-    print(f"PASS {PASSED}  FAIL {FAILED}")
-    if FAILURES:
-        print("失败用例:", ", ".join(FAILURES))
-    return FAILED == 0
 
-
-if __name__ == "__main__":
-    sys.exit(0 if main() else 1)

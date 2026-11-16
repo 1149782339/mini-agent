@@ -1,7 +1,7 @@
 """离线测试：Read 读图片，以及发给模型时附上或省略。
 
 不需要 API key：
-    uv run python examples/image_test.py
+    uv run pytest
 """
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ import base64
 import json
 import os
 import shutil
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from mini_agent.client import LLM, _TOOL_IMAGE_OMITTED  # noqa: E402
 from mini_agent.compaction import serialize_for_summary  # noqa: E402
@@ -29,26 +27,18 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 
-PASSED = FAILED = 0
-FAILURES: list[str] = []
 
 
-def check(name: str, cond: bool, detail: str = ""):
-    global PASSED, FAILED
-    if cond:
-        PASSED += 1
-        print(f"  ok  {name}")
-    else:
-        FAILED += 1
-        FAILURES.append(name)
-        print(f"  FAIL {name}  {detail}")
+def check(name: str, cond: bool, detail: str = "") -> None:
+    assert cond, f"{name}  {detail}"
+
 
 
 def _chunk(kind: bytes, data: bytes) -> bytes:
     return len(data).to_bytes(4, "big") + kind + data + b"\x00\x00\x00\x00"
 
 
-def main() -> bool:
+def test_image_suite() -> None:
     shutil.rmtree(SANDBOX, ignore_errors=True)
     SANDBOX.mkdir(parents=True)
     (SANDBOX / "dot.png").write_bytes(PNG_1X1)
@@ -230,12 +220,4 @@ def main() -> bool:
         else:
             os.environ["MINI_AGENT_VISION"] = old
 
-    print("=" * 60)
-    print(f"PASS {PASSED}  FAIL {FAILED}")
-    if FAILURES:
-        print("失败用例:", ", ".join(FAILURES))
-    return FAILED == 0
 
-
-if __name__ == "__main__":
-    raise SystemExit(0 if main() else 1)

@@ -2,7 +2,7 @@
 
 一个能真跑的编码代理：工具调用闭环、上下文自动压缩、SQLite 会话。
 核心代码在 `src/mini_agent/`，约 5100 行。依赖 `openai`、`pillow`、`python-dotenv`、`rich`，
-需要 Python ≥ 3.14，用 uv 管理（`uv run mini-agent`）。
+需要 Python ≥ 3.13，用 uv 管理（`uv run mini-agent`）。
 
 ## 快速开始
 
@@ -48,7 +48,7 @@ uv run mini-agent -p "任务" --json --tools "Read,Write"
 ```
 
 REPL 命令：`/help` `/clear` `/compact` `/tokens` `/log` `/session` `/quit`
-（`/exit`、`/q` 等同于退出）。`/clear` 和 `/compact` 会同步写回会话库。
+（`/exit`、`/q` 等同于退出）。`/compact` 把摘要写入会话库，原文仍保留；`/clear` 只重置当前视图，原文同样保留。
 退出时打印恢复命令：`mini-agent --resume <会话 ID>`。
 
 ## 工具
@@ -114,7 +114,8 @@ src/mini_agent/
 ├── client.py       # OpenAI 兼容客户端；流式；usage 锚点；重试
 ├── compaction.py   # 压缩纯函数：切点 / 摘要序列化 / 文件清单 / 模板
 ├── context.py      # 历史管理 + 压缩（token 预算切分 / 结构化摘要 / 质量闸 / 兜底）
-├── store.py        # SQLite 会话持久化（sessions + messages 两表）
+├── store.py        # SQLite 会话持久化（sessions + messages + session_events）
+├── envutil.py      # 子进程环境清理（去掉 API key 等密钥）
 ├── loop.py         # 主循环：请求 → tool_calls → 回填 → 再请求
 ├── cli.py          # REPL、print 模式、子代理进度面板
 └── tools/
@@ -158,8 +159,8 @@ src/mini_agent/
 
 provider 返回上下文过长时，主循环强制压缩并重试这一轮恰好一次。
 
-还没有 split-turn 双摘要、分支摘要、append-only 事件树。
-压缩后原文不保留，只留摘要。极长会话会多次压缩，细节会丢。
+还没有 split-turn 双摘要、分支摘要、分支事件树。
+压缩和 `/clear` 都只改发给模型的视图，SQLite 里的原文仍在，resume 时按最近一次压缩/清空重建视图。极长会话会多次压缩，模型侧细节会丢，但磁盘上可以回看原文。
 
 ## 配置
 
@@ -221,26 +222,22 @@ DeepSeek、Kimi、MiniMax 要求历史里的 assistant 消息带 `reasoning_cont
 
 ## 测试
 
+离线测试已收成 pytest 套件，不需要 API key：
+
 ```bash
-uv run python examples/tool_test.py       # 离线：文件五件套 + 框架行为
-uv run python examples/image_test.py      # 离线：Read 图片、缩放、请求里附图或省略
-uv run python examples/context_test.py    # 离线：压缩管线（假 LLM）
-uv run python examples/retry_test.py      # 离线：重试分类、退避、溢出恢复（假 API）
-uv run python examples/parallel_test.py   # 离线：并行派发、按序回填、截断不派发
-uv run python examples/subagent_test.py   # 离线：print 模式 argv、JSON 事件、截断、注册开关
-uv run python examples/smoke_test.py      # 需要 API key：工具闭环 + 真实压缩
-uv run python examples/timeout_check.py   # 离线：超时后进程树被杀掉
-uv run python examples/shell_test.py      # 手工脚本：继承环境、退出码、超时、cwd、管道
+uv sync --group dev
+uv run pytest
 ```
 
-`context_test` 覆盖切点不拆配对、摘要序列化、文件清单、六节模板与更新模式、
-坏摘要拒收、机械裁剪、usage 锚点作废、小窗口预算收缩。
+覆盖文件工具、图片、压缩管线、会话库（压缩后原文仍在、视图是摘要）、
+API 重试与溢出恢复、并行派发、子代理 argv/事件、`run_command` 行为，
+以及子进程环境会去掉 API key。
 
-`tool_test` 覆盖 read-before-write、staleness 闸、CRLF / UTF-16 / BOM、
-弯引号、`file_unchanged`、分页、二进制 / UNC / 越界拒绝、Grep 三模式、
-Glob 排序截断、字符串布尔容错。
+需要真实 API key 的冒烟测试不在默认 pytest 里，请单独跑：
 
-`timeout_check` 让子进程睡 5 秒后写标记文件，超时设 1 秒，断言超时被识别且标记文件不会出现。
+```bash
+uv run python examples/smoke_test.py      # 工具闭环 + 真实压缩
+```
 
 ## 安全边界
 
@@ -249,7 +246,9 @@ Glob 排序截断、字符串布尔容错。
 - Edit / Write 修改已存在文件前，本会话必须 Read 过它，且磁盘未被外部改过。
 - UNC 路径不做任何文件系统操作。设备文件（如 `/dev/zero`）在黑名单里。
 - `run_command` 的 cwd 受 `workdir` 约束。命令本身没有白名单。
-- `run_command` 继承当前进程的完整环境，子进程能看到 `PATH`、`HOME` 和 API key。
+- `run_command` 继承 `PATH`、`HOME` 等运行环境，但不传递 `MINI_AGENT_API_KEY`、`ARK_API_KEY` 以及其他常见密钥变量。
+  Task 子代理同样不继承这些密钥；子进程启动时由 `load_config()` 自行读取项目 `.env` 或 `~/.hermes/.env`。
+  如果密钥只存在于父进程环境、文件里没有，子代理会因缺少 API key 而失败。
 - 超时默认 60 秒，上限 300 秒。到点杀掉整棵进程树：POSIX 对进程组发 `SIGKILL`，
   Windows 用 Job Object（Job 创建失败时才用 `taskkill`）。
 - stdin 关闭。vim / top 这类交互命令会自己退出。

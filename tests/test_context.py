@@ -1,15 +1,9 @@
 """离线测试：上下文管理（切点/序列化/文件清单/摘要/锚点记账）。
 
 不需要 API key：LLM 用假实现（只实现 summarize 接口）。
-    uv run python examples/context_test.py
+    uv run pytest
 """
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from mini_agent.client import LLM, LLMError, context_tokens, request_size  # noqa: E402
 from mini_agent.tokens import count_tokens_json  # noqa: E402
@@ -24,19 +18,11 @@ from mini_agent.compaction import (  # noqa: E402
 from mini_agent.config import Config  # noqa: E402
 from mini_agent.context import COMPACTION_MARKER, Context  # noqa: E402
 
-PASSED = FAILED = 0
-FAILURES: list[str] = []
 
 
-def check(name: str, cond: bool, detail: str = ""):
-    global PASSED, FAILED
-    if cond:
-        PASSED += 1
-        print(f"  ok  {name}")
-    else:
-        FAILED += 1
-        FAILURES.append(name)
-        print(f"  FAIL {name}  {detail}")
+def check(name: str, cond: bool, detail: str = "") -> None:
+    assert cond, f"{name}  {detail}"
+
 
 
 def make_pair(content_len: int = 100) -> list[dict]:
@@ -75,7 +61,7 @@ def history(n_turns: int, filler_len: int = 200) -> list[dict]:
     return msgs
 
 
-def main() -> bool:
+def test_context_suite() -> None:
     print("[find_cut_point]")
     msgs = history(3)
     cut = find_cut_point(msgs, 10**9)
@@ -260,12 +246,4 @@ def main() -> bool:
     c = Context(small)
     check("小窗口收缩保留预算", c._keep_tokens() <= small.compact_threshold // 2)
 
-    print("=" * 60)
-    print(f"PASS {PASSED}  FAIL {FAILED}")
-    if FAILURES:
-        print("失败用例:", ", ".join(FAILURES))
-    return FAILED == 0
 
-
-if __name__ == "__main__":
-    sys.exit(0 if main() else 1)
