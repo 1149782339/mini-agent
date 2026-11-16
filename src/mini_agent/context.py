@@ -2,9 +2,11 @@
 
 1. 切分：token 预算制（keep_recent_tokens）——从最新往回累加估算到预算即停；
    切点绝不切断 toolCall/toolResult 配对（compaction.find_cut_point）；
+   若切点落在一轮中间，历史和当前轮前缀分开摘要（prepare_compaction）；
 2. 摘要：输入先序列化成 [User]/[Tool result] 标签文本（防模型续写对话、
    工具结果限 2000 字符、思维链丢弃），固定 6 节结构模板；有旧摘要时走
-   "更新合并"模式而非重写；
+   "更新合并"模式而非重写。拆轮时再写一份当前轮前缀摘要，合并到
+   Turn Context (split turn) 小节下，本轮后缀仍保留原文；
 3. 文件清单：<read-files>/<modified-files> 从工具调用参数机械提取，
    确定性附加在摘要尾（跨次压缩随摘要文本累积）；
 4. 质量闸：摘要为空/被截断(finish_reason=length)/像续写或报错 → 拒收，
@@ -22,9 +24,12 @@ from .tokens import content_image_count, content_text, message_tokens
 from .compaction import (
     append_file_lists,
     build_summary_prompt,
+    build_turn_prefix_prompt,
     extract_file_operations,
     find_cut_point,
     looks_like_bad_summary,
+    merge_split_summaries,
+    prepare_compaction,
     serialize_for_summary,
 )
 from .config import Config, SYSTEM_PROMPT
@@ -40,6 +45,7 @@ class CompactionReport:
     dropped_messages: int
     summarised: bool
     attempts: int = 1
+    is_split_turn: bool = False
 
 
 @dataclass
@@ -79,6 +85,10 @@ class Context:
         """切点：tail = messages[cut:] 保留，head = messages[1:cut] 进摘要。"""
         return find_cut_point(self.messages, self._keep_tokens(tools))
 
+    def _find_plan(self, tools: list[dict] | None = None):
+        """切分方案：含是否拆轮、本轮起点。"""
+        return prepare_compaction(self.messages, self._keep_tokens(tools))
+
     def _previous_summary(self) -> str:
         """从历史里取出上一份压缩摘要（迭代式摘要的"旧摘要"输入）。"""
         for msg in self.messages:
@@ -100,6 +110,17 @@ class Context:
                 "[以上为历史摘要；以下为最近的真实对话，请接着处理]"
             ),
         }
+
+    @staticmethod
+    def _try_summary(llm: LLM, prompt: str, min_length: int = 80) -> str | None:
+        """调用模型写摘要；质量闸拒收或调用失败时返回 None。"""
+        try:
+            candidate = llm.summarize(prompt)
+            if looks_like_bad_summary(candidate, min_length=min_length):
+                raise LLMError("summary rejected by quality gate")
+            return candidate
+        except LLMError:
+            return None
 
     # ---------- 校验 ----------
     def validate(self, tools: list[dict] | None = None) -> list[str]:
@@ -159,39 +180,85 @@ class Context:
             while attempts < max_attempts and (attempts == 0 or self.should_compact(tools)):
                 attempts += 1
                 snapshot = list(self.messages)  # 只回滚这一次，不丢掉上一轮已经成功的摘要
-                cut = self._find_split(tools)
+                plan = self._find_plan(tools)
+                cut = plan.cut
                 if cut <= 1:
                     if not self._shrink_oversized():
                         break
                     continue
-                head = self.messages[1:cut]
                 tail = self.messages[cut:]
-
                 previous = self._previous_summary()
-                read_files, modified_files = extract_file_operations(head)
-                prompt = build_summary_prompt(
-                    serialize_for_summary(head),
-                    previous,
-                    read_files,
-                    modified_files,
-                )
-
                 summary_text = ""
-                try:
-                    candidate = llm.summarize(prompt)
-                    if looks_like_bad_summary(candidate):
-                        raise LLMError("summary rejected by quality gate")
-                    # 文件清单确定性附加，不让 LLM 自由发挥路径
-                    summary_text = append_file_lists(candidate, read_files, modified_files)
-                    summarised = True
-                except LLMError:
-                    summary_text = ""
 
-                if summary_text:
-                    dropped += len(head)
-                    self.messages = [self.messages[0], self._marker_message(summary_text), *tail]
+                if plan.is_split_turn:
+                    history = self.messages[1:plan.turn_start]
+                    prefix = self.messages[plan.turn_start:cut]
+                    # 文件清单覆盖将被摘要替换的全部消息（历史 + 本轮前缀）
+                    read_files, modified_files = extract_file_operations(
+                        history + prefix
+                    )
+                    history_text = previous or "无更早历史。"
+                    ok = True
+                    if history:
+                        hist_prompt = build_summary_prompt(
+                            serialize_for_summary(history),
+                            previous,
+                            read_files,
+                            modified_files,
+                        )
+                        got = self._try_summary(llm, hist_prompt)
+                        if got is None:
+                            ok = False
+                        else:
+                            history_text = got
+                    prefix_text = None
+                    if ok:
+                        prefix_text = self._try_summary(
+                            llm,
+                            build_turn_prefix_prompt(serialize_for_summary(prefix)),
+                            min_length=40,
+                        )
+                        if prefix_text is None:
+                            ok = False
+                    if ok and prefix_text is not None:
+                        summary_text = append_file_lists(
+                            merge_split_summaries(history_text, prefix_text),
+                            read_files,
+                            modified_files,
+                        )
+                        dropped += len(history) + len(prefix)
+                        self.messages = [
+                            self.messages[0],
+                            self._marker_message(summary_text),
+                            *tail,
+                        ]
+                        summarised = True
                 else:
-                    # 摘要失败：机械裁掉最老一半；裁不动就截断单条超长消息
+                    head = self.messages[1:cut]
+                    read_files, modified_files = extract_file_operations(head)
+                    prompt = build_summary_prompt(
+                        serialize_for_summary(head),
+                        previous,
+                        read_files,
+                        modified_files,
+                    )
+                    candidate = self._try_summary(llm, prompt)
+                    if candidate is not None:
+                        # 文件清单确定性附加，不让 LLM 自由发挥路径
+                        summary_text = append_file_lists(
+                            candidate, read_files, modified_files
+                        )
+                        dropped += len(head)
+                        self.messages = [
+                            self.messages[0],
+                            self._marker_message(summary_text),
+                            *tail,
+                        ]
+                        summarised = True
+
+                if not summary_text:
+                    # 摘要失败（含拆轮时任一份被拒收）：整段走机械裁剪，
+                    # 不采用只成功一半的摘要，避免把当前请求埋进残缺上下文。
                     kept = self._mechanical_trim()
                     if kept is None and not self._shrink_oversized():
                         break
@@ -210,6 +277,10 @@ class Context:
             dropped_messages=dropped,
             summarised=summarised,
             attempts=attempts,
+            is_split_turn=any(
+                "Turn Context (split turn)" in content_text(m.get("content"))
+                for m in self.messages
+            ),
         )
         self.log.append(report)
         return report
