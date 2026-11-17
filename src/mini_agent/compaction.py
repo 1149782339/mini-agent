@@ -25,7 +25,7 @@ SUMMARY_CONTENT_CHARS = 4000       # 摘要输入里单条 user/assistant 正文
 FILE_LIST_CAP = 200                # 文件清单最多列多少条
 
 TOOL_NAME_READ = {"Read", "Glob", "Grep", "Ls"}
-TOOL_NAME_MODIFY = {"Edit", "Write"}
+TOOL_NAME_MODIFY = {"Edit", "Write", "RM", "MV"}
 
 
 # ---------- 切点 ----------
@@ -178,7 +178,7 @@ def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]
     read_files: set[str] = set()
     modified_files: set[str] = set()
 
-    def _add(args_raw: str, bucket: set[str], keys: tuple[str, ...]) -> None:
+    def _add(args_raw: str, bucket: set[str], keys: tuple[str, ...], *, take_all: bool = False) -> None:
         try:
             args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
         except (json.JSONDecodeError, TypeError):
@@ -189,7 +189,8 @@ def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]
             value = args.get(key)
             if isinstance(value, str) and value.strip():
                 bucket.add(value.strip())
-                return
+                if not take_all:
+                    return
 
     for msg in messages:
         if msg.get("role") != "assistant":
@@ -201,7 +202,7 @@ def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]
             if name in TOOL_NAME_READ:
                 _add(args, read_files, ("file_path", "path", "pattern"))
             elif name in TOOL_NAME_MODIFY:
-                _add(args, modified_files, ("file_path",))
+                _add(args, modified_files, ("file_path", "path", "source", "destination"), take_all=True)
 
     return (
         sorted(read_files)[:FILE_LIST_CAP],

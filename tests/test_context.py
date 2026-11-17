@@ -108,9 +108,11 @@ def test_context_suite() -> None:
             {"id": "b", "function": {"name": "Grep", "arguments": '{"path": "src", "pattern": "x"}'}},
             {"id": "c", "function": {"name": "Write", "arguments": '{"file_path": "w1.py"}'}},
             {"id": "d", "function": {"name": "Edit", "arguments": '{broken json'}},
+            {"id": "e", "function": {"name": "RM", "arguments": '{"path": "old.txt"}'}},
+            {"id": "f", "function": {"name": "MV", "arguments": '{"source": "a.txt", "destination": "b.txt"}'}},
         ]},
     ])
-    check("读取/修改分类正确", rf == ["r1.py", "src"] and mf == ["w1.py"], f"{rf} {mf}")
+    check("读取/修改分类正确", rf == ["r1.py", "src"] and mf == ["a.txt", "b.txt", "old.txt", "w1.py"], f"{rf} {mf}")
 
     print("[build_summary_prompt]")
     p = build_summary_prompt("对话文本", previous_summary="旧摘要ABC",
