@@ -91,13 +91,18 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
   步数、token、一行摘要；长思考期间有「思考中 N 字」心跳。
 - **run_command**：见下方安全边界。Windows 上优先 Git Bash（`bash.exe -lc`，
   找不到则退回 cmd），POSIX 上是 `sh -c`。按 bash 语法写命令。
+  长时间任务可设 `background=true`，立刻返回 `job_id`，不受 300 秒硬杀限制；
+  再加 `notify_on_complete=true` 时，任务结束后用合成消息叫醒交互式主代理。
+  前台命令触达超时时，交互模式会升级为后台并打开完成通知，而不是杀掉。
+- **process_manage**：管理后台命令，动作是 `list` / `poll` / `log` / `wait` / `kill`。
+  同一任务连续两次 poll 或 wait 且没有新输出时，自动改为完成通知。轮询对防空转护栏豁免提示和硬停。
 
 没有权限层。Glob / Grep 使用 rg 默认语义
 （跳过隐藏文件、尊重 `.gitignore`）。`MINI_AGENT_RG_ALL=1` 改为搜索隐藏文件并忽略 gitignore。
 
 同一轮按 `tool_calls` 的顺序执行。连续的 `is_concurrency_safe()` 工具
-（Read / Ls / Glob / Grep / Task）并行，最多 4 个线程。Edit、Write、RM、MV、`run_command`
-是屏障，在主线程按原顺序执行，所以「先改文件再跑测试」不会把测试跑到修改前面。
+（Read / Ls / Glob / Grep / Task）并行，最多 4 个线程。Edit、Write、RM、MV、`run_command`、
+`process_manage` 是屏障，在主线程按原顺序执行，所以「先改文件再跑测试」不会把测试跑到修改前面。
 同一路径的写入还有一把互斥锁。`finish_reason=length` 时工具参数视为被截断，
 不执行，回一条合成错误让模型把输出拆小。Ctrl+C 会给还没回填的 `tool_call`
 补上「已中断」，避免历史里留下没有结果的工具调用。
@@ -105,7 +110,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 主循环里还有一层防空转护栏（`guardrails.py`，思路来自 Hermes，只做瘦身版）。
 同一轮用户输入里，连续用相同参数打出相同结果：第 2 次且结果超过 512 字符时，
 工具仍执行，但写入上下文的改成短引用；第 3 次给模型追加提示；另外会抓周期
-2 到 4 的循环（例如 Read A、Grep B 交替）。同一工具同一参数失败，第 2 次警告；
+2 到 4 的循环（例如 Read A、Grep B 交替）。`process_manage` 视为轮询类工具，豁免提示和硬停，短引用照做。同一工具同一参数失败，第 2 次警告；
 `-p` / 脚本 / Task 子代理默认开硬停，第 5 次在执行前拦截，第 5 次相同成功调用
 或第 8 次「同一工具换参数失败」会结束本轮（`run_command` 对后一种不硬停，
 因为测试和编译失败是正常诊断）。交互式 CLI 默认只警告、不硬停。`Edit` /
@@ -129,8 +134,9 @@ src/mini_agent/
 ├── store.py        # SQLite 会话持久化（sessions + messages + session_events）
 ├── envutil.py      # 子进程环境清理（去掉 API key 等密钥）
 ├── guardrails.py   # 防空转：相同调用盯梢、周期循环、失败拦截
+├── jobs.py         # 后台命令注册表：完成通知、查询、退出清理
 ├── loop.py         # 主循环：请求 → tool_calls → 回填 → 再请求
-├── cli.py          # REPL、print 模式、子代理进度面板
+├── cli.py          # REPL（输入线程 + 完成通知唤醒）、print 模式、子代理进度面板
 └── tools/
     ├── base.py        # 四段生命周期 + 注册表 + 输出落盘截断
     ├── filestate.py   # 读状态 LRU 缓存（read-before-write 的状态机）
@@ -143,7 +149,7 @@ src/mini_agent/
     ├── grep_tool.py   # Grep
     ├── ls.py          # Ls
     ├── rg.py          # ripgrep 子进程封装
-    ├── shell.py       # run_command
+    ├── shell.py       # run_command + process_manage
     └── subagent.py    # Task
 ```
 
@@ -274,13 +280,18 @@ uv run python examples/smoke_test.py      # 工具闭环 + 真实压缩
 - `run_command` 继承 `PATH`、`HOME` 等运行环境，但不传递 `MINI_AGENT_API_KEY`、`ARK_API_KEY` 以及其他常见密钥变量。
   Task 子代理同样不继承这些密钥；子进程启动时由 `load_config()` 自行读取项目 `.env` 或 `~/.hermes/.env`。
   如果密钥只存在于父进程环境、文件里没有，子代理会因缺少 API key 而失败。
-- 超时默认 60 秒，上限 300 秒。到点杀掉整棵进程树：POSIX 对进程组发 `SIGKILL`，
-  Windows 用 Job Object（Job 创建失败时才用 `taskkill`）。
+- 前台超时默认 60 秒，上限 300 秒。交互模式下到点不杀，升级为后台任务并打开完成通知；
+  `-p` / 非交互模式仍杀掉整棵进程树。后台任务不受这 300 秒硬杀限制。
+  终止时 POSIX 对进程组发 `SIGKILL`，Windows 用 Job Object（Job 创建失败时才用 `taskkill`）。
+  退出交互式 CLI 或 Ctrl+C 离开 REPL 时，会清理仍在跑的后台进程。
 - stdin 关闭。vim / top 这类交互命令会自己退出。
 - 工具异常变成 `ERROR: ...` 返回给模型，不让主循环崩溃。
 
 ## 已知限制
 
+- 后台 Task 没有做：子代理仍然会挡住父轮。下载/编译用后台 `run_command` 即可。
+- `-p` 模式关闭完成通知（退出后没有人接手），结束时会清掉还在跑的后台任务。
+- 没有 watch_patterns、heartbeat、跨重启恢复，也没有关掉窗口还能继续跑的网关。
 - 审批没有实现。`check_permissions` 只是扩展点。
 - Task 只有 single 模式：没有 parallel / chain，没有 `agents/*.md` 自定义定义。
   父终端看得到步骤级进度。Ctrl+C 会杀掉子进程。

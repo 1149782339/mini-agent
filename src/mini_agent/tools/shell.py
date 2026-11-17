@@ -348,10 +348,16 @@ class ShellTools:
         hard_timeout: int = HARD_TIMEOUT,
         env: dict[str, str] | None = None,
         shell: str = "auto",
+        jobs=None,
     ):
         self.workdir = workdir.resolve()
         self.default_timeout = default_timeout
         self.hard_timeout = hard_timeout
+        # 延迟导入，避免与 jobs 循环引用
+        if jobs is None:
+            from ..jobs import JobRegistry
+            jobs = JobRegistry()
+        self.jobs = jobs
         # 拷贝运行环境，但去掉 API key 等密钥，避免命令直接读到凭证
         self.env = sanitize_subprocess_env(os.environ if env is None else env)
         # 统一 UTF-8：让子进程（尤其 python）也按 UTF-8 输出，解码端不用猜编码
@@ -413,7 +419,15 @@ class ShellTools:
         return note + text[-MAX_BUFFER:]
 
     # ---------- 工具实现 ----------
-    def run_command(self, command: str, timeout: int | None = None, cwd: str | None = None) -> str:
+    def run_command(
+        self,
+        command: str,
+        timeout: int | None = None,
+        cwd: str | None = None,
+        background: bool | str = False,
+        notify_on_complete: bool | str = False,
+    ) -> str:
+        from .base import semantic_bool
         command = (command or "").strip()
         if not command:
             return "ERROR: command 不能为空"
@@ -421,9 +435,9 @@ class ShellTools:
         if blocked:
             return _rm_mv_blocked_message(blocked)
         command = rewrite_windows_null_redirect(command)
+        background = semantic_bool(background, False)
+        notify_requested = semantic_bool(notify_on_complete, False)
 
-        limit = int(timeout) if timeout else self.default_timeout
-        limit = max(1, min(limit, self.hard_timeout))
         try:
             workdir = self._resolve_cwd(cwd)
         except PermissionError as exc:
@@ -431,7 +445,81 @@ class ShellTools:
         if not workdir.exists():
             return f"ERROR: cwd 不存在 {workdir}"
 
+        proc, job_obj = self._spawn(command, workdir)
+        job = self.jobs.add_running(
+            proc,
+            command=command,
+            cwd=workdir,
+            win_job=job_obj,
+            notify_on_complete=notify_requested if background else False,
+        )
+        if background:
+            return self.jobs.format_started(job, notify_requested=notify_requested)
+
+        # 前台：仍受 timeout / hard_timeout 约束，但超时后交互模式升级为后台。
+        limit = int(timeout) if timeout else self.default_timeout
+        limit = max(1, min(limit, self.hard_timeout))
+        register_shell(proc, job_obj)
         started = time.monotonic()
+        try:
+            finished = job.done.wait(timeout=limit)
+        except KeyboardInterrupt:
+            if job_obj is not None and getattr(job_obj, "active", False):
+                job_obj.kill()
+            else:
+                kill_process_tree(proc)
+            raise
+        finally:
+            unregister_shell(proc)
+
+        if finished:
+            out, err = job.snapshot()
+            elapsed = time.monotonic() - started
+            parts = [
+                f"exit={job.exit_code}  time={elapsed:.2f}s  cwd={workdir}  shell={self.shell_name}"
+            ]
+            if out.strip():
+                parts.append("--- stdout ---\n" + self._clip(out.rstrip(), "stdout"))
+            if err.strip():
+                parts.append("--- stderr ---\n" + self._clip(err.rstrip(), "stderr"))
+            if not out.strip() and not err.strip():
+                parts.append("(无输出)")
+            if job_obj is not None:
+                job_obj.close()
+                job.win_job = None
+            return "\n".join(parts)
+
+        # 超时
+        if self.jobs.allow_notify:
+            job.notify_on_complete = True
+            job.upgraded_from_timeout = True
+            return self.jobs.format_started(job, notify_requested=True, upgraded=True)
+
+        self.jobs.manage("kill", job.job_id)
+        out, err = job.snapshot()
+        elapsed = time.monotonic() - started
+        parts = [
+            f"exit={job.exit_code}  time={elapsed:.2f}s  cwd={workdir}  shell={self.shell_name}"
+            "  [TIMEOUT，已杀进程树]"
+        ]
+        if out.strip():
+            parts.append("--- stdout ---\n" + self._clip(out.rstrip(), "stdout"))
+        if err.strip():
+            parts.append("--- stderr ---\n" + self._clip(err.rstrip(), "stderr"))
+        if not out.strip() and not err.strip():
+            parts.append("(无输出)")
+        return "\n".join(parts)
+
+    def process_manage(
+        self,
+        action: str,
+        job_id: str | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        return self.jobs.manage(action, job_id=job_id, timeout=timeout)
+
+    def _spawn(self, command: str, workdir: Path):
+        """启动命令：不通信、不关闭，调用方负责等待或交给注册表。"""
         if self.bash is not None:
             # Git Bash：-l 载入 profile（拿到 /usr/bin 的 grep/sed/awk），-c 执行命令
             argv: list[str] | str = [str(self.bash), "-lc", command]
@@ -451,55 +539,13 @@ class ShellTools:
             # 子进程不新建控制台窗口
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        job = WindowsJob() if WindowsJob is not None else None
-        if job is not None:
-            job.attach(proc)
-        register_shell(proc, job)
-
-        timed_out = False
-        try:
-            try:
-                out_raw, err_raw = proc.communicate(timeout=limit)
-            except KeyboardInterrupt:
-                if job is not None and job.active:
-                    job.kill()
-                else:
-                    kill_process_tree(proc)
-                raise
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                if job is not None and job.active:
-                    job.kill()
-                else:
-                    kill_process_tree(proc)
-                try:
-                    out_raw, err_raw = proc.communicate(timeout=KILL_WAIT)
-                except subprocess.TimeoutExpired as exc:
-                    # 极端情况：孙进程仍占着管道，放弃等待，保留已读到的输出
-                    out_raw, err_raw = exc.stdout or b"", exc.stderr or b""
-        finally:
-            unregister_shell(proc)
-            if job is not None:
-                job.close()
-
-        out = decode_output(out_raw)
-        err = decode_output(err_raw)
-
-        elapsed = time.monotonic() - started
-        code = proc.returncode
-        parts = [
-            f"exit={code}  time={elapsed:.2f}s  cwd={workdir}  shell={self.shell_name}"
-            + ("  [TIMEOUT，已杀进程树]" if timed_out else "")
-        ]
-        if out.strip():
-            parts.append("--- stdout ---\n" + self._clip(out.rstrip(), "stdout"))
-        if err.strip():
-            parts.append("--- stderr ---\n" + self._clip(err.rstrip(), "stderr"))
-        if not out.strip() and not err.strip():
-            parts.append("(无输出)")
-        return "\n".join(parts)
+        job_obj = WindowsJob() if WindowsJob is not None else None
+        if job_obj is not None:
+            job_obj.attach(proc)
+        return proc, job_obj
 
     # ---------- 注册 ----------
+
     def tools(self) -> list[FnTool]:
         return [
             FnTool(
@@ -511,6 +557,9 @@ class ShellTools:
                     "Linux/macOS 上是 sh。继承 PATH/HOME 等运行环境，但不传递 API key 等密钥。"
                     "用于跑测试、编译、安装依赖、查看进程。非交互式，stdin 已关闭，"
                     "不要用它跑 vim/top 之类交互程序。"
+                    "长时间任务（下载、编译）请设 background=true，立刻返回 job_id，不要同步死等；"
+                    "需要做完后自动继续时再加 notify_on_complete=true。"
+                    "前台命令触达超时时，交互模式下会升级为后台并打开完成通知，而不是杀掉。"
                     "不要在这里直接执行 rm 或 mv（包括 /bin/rm、/usr/bin/mv），请改用 RM 或 MV 工具；"
                     "路径必须是工作目录内的字面绝对路径。这是安全带，不拦 python / find -delete / git rm 等绕法。"
                 ),
@@ -523,16 +572,56 @@ class ShellTools:
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "超时秒数，默认 60，最大 300",
+                            "description": "前台超时秒数，默认 60，最大 300。后台任务不受此硬杀限制。",
                             "default": DEFAULT_TIMEOUT,
                         },
                         "cwd": {
                             "type": "string",
                             "description": "工作目录（相对或绝对，必须在工作根内），默认工作根",
                         },
+                        "background": {
+                            "type": "boolean",
+                            "description": "true 时立即返回 job_id，进程在后台继续跑，不受 300 秒硬杀限制",
+                            "default": False,
+                        },
+                        "notify_on_complete": {
+                            "type": "boolean",
+                            "description": "true 时任务结束后用合成消息叫醒交互式主代理。-p 等非交互模式会忽略此开关。",
+                            "default": False,
+                        },
                     },
                     "required": ["command"],
                 },
                 fn=self.run_command,
-            )
+            ),
+            FnTool(
+                name="process_manage",
+                description=(
+                    "管理后台命令：list 列出全部任务；poll 查看状态和新输出；"
+                    "log 读取已落盘的完整输出（上下文里仍会截断）；"
+                    "wait 等待结束或直到 timeout（默认 30 秒，最大 300）；"
+                    "kill 终止进程树。若已打开完成通知，不要反复 poll。"
+                    "同一任务连续两次 poll 或 wait 且没有新输出时，会自动改为完成通知。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "poll", "log", "wait", "kill"],
+                            "description": "list / poll / log / wait / kill",
+                        },
+                        "job_id": {
+                            "type": "string",
+                            "description": "list 以外的操作需要任务 id，例如 job_01",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "仅 wait 使用，最长等待秒数，默认 30，最大 300",
+                        },
+                    },
+                    "required": ["action"],
+                },
+                fn=self.process_manage,
+            ),
         ]

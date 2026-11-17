@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -141,6 +142,9 @@ def run_print_mode(args, cfg, llm=None) -> int:
             system_prompt = f"{system_prompt}\n\n{extra.strip()}"
 
     registry = build_tools(cfg)
+    jobs = getattr(registry, "jobs", None)
+    if jobs is not None:
+        jobs.allow_notify = False
     # 防递归：print 模式永不提供 Task，子代理不能再派子代理
     registry.tools.pop("Task", None)
     if args.tools:
@@ -196,13 +200,17 @@ def run_print_mode(args, cfg, llm=None) -> int:
     if not args.json:
         _force_utf8_stdio()
     agent.on_delta = _delta
-    answer = agent.run(args.print_prompt, _event_override=_forward)
+    try:
+        answer = agent.run(args.print_prompt, _event_override=_forward)
 
-    if answer.startswith("ERROR:"):
-        _emit({"type": "error", "message": answer})
-        return 1
-    _emit({"type": "result", "result": answer, "steps": None})
-    return 0
+        if answer.startswith("ERROR:"):
+            _emit({"type": "error", "message": answer})
+            return 1
+        _emit({"type": "result", "result": answer, "steps": None})
+        return 0
+    finally:
+        if jobs is not None:
+            jobs.cleanup_all()
 
 
 class StreamPrinter:
@@ -276,6 +284,133 @@ class StreamPrinter:
             )
         elif event == "error":
             print(_c(f"  [错误] {payload['message']}", "red", self.color))
+
+
+class InteractiveSession:
+    """交互式 REPL：用户输入和后台完成通知抢同一把调度锁，串行进入 Agent.run。
+
+    输入在独立线程读取（Windows 控制台不能靠 POSIX select 盯 stdin）。
+    一轮进行中到达的完成通知或下一条用户输入会排队，结束后再处理。
+    退出或 Ctrl+C 离开 REPL 时清掉仍在跑的后台进程。
+    """
+
+    def __init__(self, agent, store, session_id: str, registry, printer, color: bool, jobs):
+        self.agent = agent
+        self.store = store
+        self.session_id = session_id
+        self.registry = registry
+        self.printer = printer
+        self.color = color
+        self.jobs = jobs
+        self.events: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+
+    def submit(self, kind: str, payload) -> None:
+        self.events.put((kind, payload))
+
+    def _on_job_complete(self, completion) -> None:
+        self.submit("job_done", completion)
+
+    def _input_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                line = input(_c("你 › ", "green", self.color)).strip()
+            except EOFError:
+                self.submit("eof", None)
+                return
+            except KeyboardInterrupt:
+                self.submit("eof", None)
+                return
+            self.submit("user", line)
+
+    def run(self) -> None:
+        if self.jobs is not None:
+            self.jobs.on_complete(self._on_job_complete)
+        reader = threading.Thread(target=self._input_loop, name="repl-input", daemon=True)
+        reader.start()
+        try:
+            self._dispatch_loop()
+        finally:
+            self._stop.set()
+            if self.jobs is not None:
+                self.jobs.cleanup_all()
+
+    def _dispatch_loop(self) -> None:
+        while True:
+            kind, payload = self.events.get()
+            if kind == "eof":
+                return
+            if kind == "user":
+                if self._handle_user(payload) == "quit":
+                    return
+            elif kind == "job_done":
+                self._handle_completion(payload)
+
+    def _handle_user(self, line: str) -> str | None:
+        if not line:
+            return None
+        if line in {"/quit", "/exit", "/q"}:
+            return "quit"
+        if line == "/help":
+            print("/clear 清空历史  /compact 立即压缩  /tokens 查看用量"
+                  "  /log 压缩记录  /session 显示会话 ID  /quit 退出")
+            return None
+        if line == "/session":
+            view_n = self.store.view_message_count(self.session_id, system_prompt=SYSTEM_PROMPT)
+            raw_n = self.store.message_count(self.session_id)
+            if raw_n > view_n:
+                print(f"{self.session_id}（当前视图 {view_n} 条，库中原文 {raw_n} 条）")
+            else:
+                print(f"{self.session_id}（{view_n} 条消息）")
+            return None
+        if line == "/clear":
+            self.agent.ctx.reset()
+            self.store.mark_clear(self.session_id)
+            print("历史已清空（原文仍保留在会话库中，当前视图已重置）")
+            return None
+        if line == "/tokens":
+            size = self.agent.ctx.size(self.registry.schemas())
+            print(f"{size} tokens（窗口 {self.agent.cfg.context_window}）")
+            return None
+        if line == "/log":
+            if not self.agent.ctx.log:
+                print("尚未压缩过")
+            for i, r in enumerate(self.agent.ctx.log, 1):
+                print(
+                    f"{i}. {r.before_tokens} → {r.after_tokens}，丢弃 {r.dropped_messages} 条，"
+                    f"摘要={r.summarised}，尝试={r.attempts}"
+                )
+            return None
+        if line == "/compact":
+            report = self.agent.compact_now(force=True)
+            if report:
+                print(f"已压缩: {report.before_tokens} → {report.after_tokens}（已记录压缩，原文保留）")
+            else:
+                print("无需压缩（历史太短）")
+            return None
+
+        if self.store is not None and self.store.current_user_message_count(self.session_id, system_prompt=SYSTEM_PROMPT) == 0:
+            self.store.set_title(self.session_id, line[:40])
+        self._run_agent(line)
+        return None
+
+    def _handle_completion(self, completion) -> None:
+        print()
+        print(_c(f"后台任务 {completion.job_id} 已结束，正在叫醒主代理…", "yellow", self.color))
+        self._run_agent(completion.message)
+
+    def _run_agent(self, text: str) -> None:
+        self.printer.printed_content = False
+        try:
+            answer = self.agent.run(text)
+        except KeyboardInterrupt:
+            self.printer.panels.stop_all()
+            print("\n（已中断本轮）")
+            return
+        if answer and not self.printer.printed_content:
+            print()
+            print(answer)
+        print()
 
 
 def main() -> None:
@@ -368,76 +503,19 @@ def main() -> None:
     print(_c("命令: /help /clear /compact /tokens /log /session /quit", "dim", color))
     print()
 
-    while True:
-        try:
-            line = input(_c("你 › ", "green", color)).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if not line:
-            continue
-        if line in {"/quit", "/exit", "/q"}:
-            break
-        if line == "/help":
-            print("/clear 清空历史  /compact 立即压缩  /tokens 查看用量"
-                  "  /log 压缩记录  /session 显示会话 ID  /quit 退出")
-            continue
-        if line == "/session":
-            view_n = store.view_message_count(session_id, system_prompt=SYSTEM_PROMPT)
-            raw_n = store.message_count(session_id)
-            if raw_n > view_n:
-                print(f"{session_id}（当前视图 {view_n} 条，库中原文 {raw_n} 条）")
-            else:
-                print(f"{session_id}（{view_n} 条消息）")
-            continue
-        if line == "/clear":
-            agent.ctx.reset()
-            store.mark_clear(session_id)
-            print("历史已清空（原文仍保留在会话库中，当前视图已重置）")
-            continue
-        if line == "/tokens":
-            size = agent.ctx.size(registry.schemas())
-            print(f"{size} tokens（窗口 {cfg.context_window}）")
-            continue
-        if line == "/log":
-            if not agent.ctx.log:
-                print("尚未压缩过")
-            for i, r in enumerate(agent.ctx.log, 1):
-                print(
-                    f"{i}. {r.before_tokens} → {r.after_tokens}，丢弃 {r.dropped_messages} 条，"
-                    f"摘要={r.summarised}，尝试={r.attempts}"
-                )
-            continue
-        if line == "/compact":
-            report = agent.compact_now(force=True)
-            if report:
-                print(f"已压缩: {report.before_tokens} → {report.after_tokens}（已记录压缩，原文保留）")
-            else:
-                print("无需压缩（历史太短）")
-            continue
-
-        if store.current_user_message_count(session_id, system_prompt=SYSTEM_PROMPT) == 0:
-            store.set_title(session_id, line[:40])
-
-        printer.printed_content = False
-        try:
-            answer = agent.run(line)
-        except KeyboardInterrupt:
-            printer.panels.stop_all()
-            print("\n（已中断本轮）")
-            continue
-        if answer and not printer.printed_content:
-            print()
-            print(answer)
+    jobs = getattr(registry, "jobs", None)
+    session = InteractiveSession(
+        agent, store, session_id, registry, printer, color, jobs
+    )
+    try:
+        session.run()
+    finally:
+        # 告诉用户怎么恢复本次会话
+        printer.panels.stop_all()
         print()
-
-    # 告诉用户怎么恢复本次会话
-    printer.panels.stop_all()
-    print()
-    print(_c("Resume this session with:", "dim", color))
-    print(_c(f"mini-agent --resume {session_id}", "cyan", color))
-    store.close()
+        print(_c("Resume this session with:", "dim", color))
+        print(_c(f"mini-agent --resume {session_id}", "cyan", color))
+        store.close()
 
 
 if __name__ == "__main__":
