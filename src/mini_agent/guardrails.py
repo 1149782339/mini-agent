@@ -11,7 +11,7 @@
    第 3 次追加提示；硬停开启时第 5 次在写回结果后结束本轮，不再请求模型。
    另外检测周期 2 到 4 的循环（例如 Read A、Grep B 交替），阈值相同。
    轮询类工具（名字在 REPEATABLE_TOOLS，或以 _poll 结尾）豁免提示和硬停，
-   短引用照做。mini-agent 目前没有这类工具，只留挂钩。
+   短引用照做。process_manage 属于这一类。
 2. 失败次数。同一工具同一参数失败：第 2 次警告；硬停开启时第 5 次在
    before_call 拦截，不再真正执行。同一工具换参数反复失败：第 3 次警告，
    硬停开启时第 8 次结束本轮；run_command 走这条不计硬停（测试/编译失败
@@ -48,7 +48,7 @@ READ_ONLY_TOOLS = frozenset({"Read", "Ls", "Glob", "Grep"})
 PROGRESS_TOOLS = frozenset({"Edit", "Write", "run_command", "Task", "RM", "MV"})
 FAILURE_TOLERANT_TOOLS = frozenset({"run_command"})
 # 轮询类工具挂钩：日后可把名字加进集合，或使用 _poll 后缀。
-REPEATABLE_TOOLS: frozenset[str] = frozenset()
+REPEATABLE_TOOLS: frozenset[str] = frozenset({"process_manage"})
 REPEATABLE_SUFFIXES: tuple[str, ...] = ("_poll",)
 
 _EXIT_RE = re.compile(r"^exit=(-?\d+)")

@@ -51,8 +51,11 @@ def build_tools(cfg, spill_dir: Path | None = None) -> ToolRegistry:
         registry = ToolRegistry(max_output=cfg.max_tool_output, context=fctx)
     for tool in (ReadTool(), EditTool(), WriteTool(), RMTool(), MVTool(), GlobTool(), GrepTool(), LsTool()):
         registry.register(tool)
+    from ..jobs import JobRegistry
+    jobs = JobRegistry()
+    registry.jobs = jobs
     if cfg.enable_shell:
-        for tool in ShellTools(cfg.workdir, shell=cfg.shell).tools():
+        for tool in ShellTools(cfg.workdir, shell=cfg.shell, jobs=jobs).tools():
             registry.register(tool)
     if cfg.enable_subagent:
         registry.register(SubagentTool())
