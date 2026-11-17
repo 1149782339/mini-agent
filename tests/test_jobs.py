@@ -173,6 +173,7 @@ def test_cleanup_all_kills_running_jobs(tmp_path: Path) -> None:
 class _FakeAgent:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.events: list[str] = []
         self._entered = threading.Event()
         self._release = threading.Event()
         self.ctx = type("C", (), {"reset": lambda self: None, "log": [], "size": lambda self, s: 0})()
@@ -183,6 +184,9 @@ class _FakeAgent:
         self._release.wait(timeout=2)
         self.calls.append(text)
         return "ok"
+
+    def record_event(self, text: str) -> None:
+        self.events.append(text)
 
     def compact_now(self, force: bool = True):
         return None
@@ -220,11 +224,11 @@ def test_completion_is_queued_during_a_run(tmp_path: Path) -> None:
         session.submit("user", "再做下一件")
         agent._release.set()
         deadline = time.monotonic() + 3
-        while len(agent.calls) < 3 and time.monotonic() < deadline:
+        while (len(agent.calls) < 2 or len(agent.events) < 1) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert agent.calls[0] == "先做这件事"
-        assert "后台任务完成通知" in agent.calls[1]
-        assert agent.calls[2] == "再做下一件"
+        assert agent.calls == ["先做这件事", "再做下一件"]
+        assert any("后台任务完成通知" in e for e in agent.events)
+        assert all("后台任务完成通知" not in c for c in agent.calls)
     finally:
         session.submit("eof", None)
         thread.join(timeout=2)

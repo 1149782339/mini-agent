@@ -287,10 +287,11 @@ class StreamPrinter:
 
 
 class InteractiveSession:
-    """交互式 REPL：用户输入和后台完成通知抢同一把调度锁，串行进入 Agent.run。
+    """交互式 REPL：用户输入和后台完成通知抢同一把调度锁。
 
     输入在独立线程读取（Windows 控制台不能靠 POSIX select 盯 stdin）。
     一轮进行中到达的完成通知或下一条用户输入会排队，结束后再处理。
+    完成通知只把退出码和输出汇报给用户并写入会话，不自动再开一轮 Agent.run。
     退出或 Ctrl+C 离开 REPL 时清掉仍在跑的后台进程。
     """
 
@@ -396,8 +397,18 @@ class InteractiveSession:
 
     def _handle_completion(self, completion) -> None:
         print()
-        print(_c(f"后台任务 {completion.job_id} 已结束，正在叫醒主代理…", "yellow", self.color))
-        self._run_agent(completion.message)
+        print(_c(f"后台任务 {completion.job_id} 已结束：", "yellow", self.color))
+        print(completion.message)
+        print(_c("结果已记录，下一步等你说了再做。", "yellow", self.color))
+        print()
+        notice = completion.message or ""
+        if "不要自动开始下一步" not in notice:
+            notice = (
+                notice
+                + "\n\n（以上是后台任务结果，已向用户汇报。请等待用户指示，不要自动开始下一步。）"
+            )
+        if self.agent is not None:
+            self.agent.record_event(notice)
 
     def _run_agent(self, text: str) -> None:
         self.printer.printed_content = False

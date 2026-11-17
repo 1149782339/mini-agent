@@ -263,7 +263,7 @@ class JobRegistry:
             f"cwd={job.cwd}  pid={getattr(job.proc, 'pid', '?')}",
         ]
         if notify:
-            notes.append("已打开完成通知：任务结束后会自动叫醒主代理，请不要反复 poll。")
+            notes.append("已打开完成通知：任务结束后会把退出码和输出汇报给你，然后停下，不会自动开始下一步。请不要反复 poll。")
         elif notify_requested and not self.allow_notify:
             notes.append(
                 "当前是非交互模式，完成通知已关闭（退出后没有人接手）。"
@@ -397,7 +397,7 @@ class JobRegistry:
         if switched:
             extra = (
                 "连续两次查看都没有新输出，已改为完成通知。"
-                "请不要再 poll/wait，任务结束后会自动叫醒主代理。"
+                "请不要再 poll/wait，任务结束后会把结果汇报给你，然后停下。"
             )
         return format_job_report(job, headline=headline, out=out, err=err, extra=extra)
 

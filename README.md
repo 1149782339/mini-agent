@@ -92,7 +92,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 - **run_command**：见下方安全边界。Windows 上优先 Git Bash（`bash.exe -lc`，
   找不到则退回 cmd），POSIX 上是 `sh -c`。按 bash 语法写命令。
   长时间任务可设 `background=true`，立刻返回 `job_id`，不受 300 秒硬杀限制；
-  再加 `notify_on_complete=true` 时，任务结束后用合成消息叫醒交互式主代理。
+  再加 `notify_on_complete=true` 时，任务结束后把退出码和输出汇报给用户并写入会话，然后停下，不自动开始下一步。
   前台命令触达超时时，交互模式会升级为后台并打开完成通知，而不是杀掉。
 - **process_manage**：管理后台命令，动作是 `list` / `poll` / `log` / `wait` / `kill`。
   同一任务连续两次 poll 或 wait 且没有新输出时，自动改为完成通知。轮询对防空转护栏豁免提示和硬停。
@@ -136,7 +136,7 @@ src/mini_agent/
 ├── guardrails.py   # 防空转：相同调用盯梢、周期循环、失败拦截
 ├── jobs.py         # 后台命令注册表：完成通知、查询、退出清理
 ├── loop.py         # 主循环：请求 → tool_calls → 回填 → 再请求
-├── cli.py          # REPL（输入线程 + 完成通知唤醒）、print 模式、子代理进度面板
+├── cli.py          # REPL（输入线程 + 完成通知汇报）、print 模式、子代理进度面板
 └── tools/
     ├── base.py        # 四段生命周期 + 注册表 + 输出落盘截断
     ├── filestate.py   # 读状态 LRU 缓存（read-before-write 的状态机）

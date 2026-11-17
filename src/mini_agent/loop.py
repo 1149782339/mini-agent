@@ -210,6 +210,13 @@ class Agent:
             " Write（每个 ≤100 行），或减少不必要的推理长度。"
         )
 
+    def record_event(self, text: str) -> None:
+        """把一条通知写入会话历史，不发起模型轮次。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._add({"role": "user", "content": text})
+
     # ---------- 对外 ----------
     def run(self, user_input: str, _event_override: EventHook | None = None) -> str:
         """跑一轮用户输入直到没有工具调用。_event_override 仅供 print 模式
