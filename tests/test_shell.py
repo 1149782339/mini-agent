@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+from mini_agent.jobs import JobRegistry
 from mini_agent.tools.shell import ShellTools
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,7 +32,7 @@ def test_run_command_basic(tmp_path: Path) -> None:
 
 
 def test_run_command_timeout_kills_tree(tmp_path: Path) -> None:
-    shell = ShellTools(tmp_path, default_timeout=10, hard_timeout=30)
+    shell = ShellTools(tmp_path, default_timeout=10, hard_timeout=30, jobs=JobRegistry(allow_notify=False))
     started = time.monotonic()
     out = shell.run_command("echo 开始; sleep 30; echo 不该到这里", timeout=2)
     elapsed = time.monotonic() - started
@@ -61,7 +62,7 @@ def test_timeout_kills_process_before_marker(tmp_path: Path) -> None:
         f"{exe} -c \"import time, pathlib; time.sleep(5); "
         f"pathlib.Path('marker.txt').write_text('alive')\""
     )
-    shell = ShellTools(work, default_timeout=10)
+    shell = ShellTools(work, default_timeout=10, jobs=JobRegistry(allow_notify=False))
     started = time.monotonic()
     result = shell.run_command(command, timeout=1)
     elapsed = time.monotonic() - started
