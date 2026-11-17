@@ -154,7 +154,9 @@ class Context:
             if not self._shrink_oversized():
                 return None
         else:
-            while attempts < max_attempts and (force or self.should_compact(tools)):
+            # force 只放行“首次即使未超阈值也压缩”；一旦已经压到阈值以下就停，
+            # 避免 /compact 第二轮摘要失败时把刚写好的摘要又机械裁掉。
+            while attempts < max_attempts and (attempts == 0 or self.should_compact(tools)):
                 attempts += 1
                 snapshot = list(self.messages)  # 只回滚这一次，不丢掉上一轮已经成功的摘要
                 cut = self._find_split(tools)

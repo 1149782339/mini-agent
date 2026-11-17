@@ -72,8 +72,11 @@ class Agent:
         self.ctx = Context(cfg)
         self.store = store
         self.session_id = session_id
-        if store is not None and session_id and store.message_count(session_id) > 0:
-            self.ctx.messages = store.load(session_id)
+        if store is not None and session_id:
+            view = store.load_view(session_id, system_prompt=self.ctx.system_prompt)
+            # 新会话视图只有注入的 system，与 Context 默认值一致
+            if len(view) > 1 or (view and store.message_count(session_id) > 0):
+                self.ctx.messages = view
         # 工具执行期上报通道（Task 子代理进度等）；挂在共享 context 上，worker 线程可用
         if self.registry.context is not None:
             self.registry.context.event_hook = self.on_event
@@ -84,9 +87,16 @@ class Agent:
         if self.store is not None and self.session_id:
             self.store.append(self.session_id, message)
 
-    def _sync_after_compaction(self) -> None:
+    def _sync_after_compaction(self, report=None) -> None:
         if self.store is not None and self.session_id:
-            self.store.replace(self.session_id, self.ctx.messages)
+            self.store.record_compaction(
+                self.session_id,
+                self.ctx.messages,
+                before_tokens=getattr(report, "before_tokens", 0) or 0,
+                after_tokens=getattr(report, "after_tokens", 0) or 0,
+                dropped_messages=getattr(report, "dropped_messages", 0) or 0,
+                summarised=bool(getattr(report, "summarised", False)),
+            )
 
     # ---------- 工具批量派发（按序执行，连续的只读/Task 并行）----------
     def _dispatch_into(
@@ -201,8 +211,10 @@ class Agent:
                     on_event(
                         "notice", {"message": "上下文超出模型窗口，先压缩再重试本轮"}
                     )
-                    self.ctx.compact(self.llm, self.registry.schemas(), force=True)
-                    self._sync_after_compaction()
+                    overflow_report = self.ctx.compact(
+                        self.llm, self.registry.schemas(), force=True
+                    )
+                    self._sync_after_compaction(overflow_report)
                 except LLMError as exc:
                     on_event("error", {"message": str(exc), "step": step})
                     return f"ERROR: {exc}"
@@ -273,8 +285,15 @@ class Agent:
     def _compact_if_needed(self) -> None:
         report = self.ctx.compact(self.llm, self.registry.schemas())
         if report is not None:
-            self._sync_after_compaction()
+            self._sync_after_compaction(report)
             self.on_event("compaction", report.__dict__)
+
+    def compact_now(self, force: bool = True):
+        """手动压缩（/compact）：更新内存视图并记录压缩事件，不删原文。"""
+        report = self.ctx.compact(self.llm, self.registry.schemas(), force=force)
+        if report is not None:
+            self._sync_after_compaction(report)
+        return report
 
     def force_compact(self):
         self.ctx.force_fit(self.registry.schemas())

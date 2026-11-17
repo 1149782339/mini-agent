@@ -1,7 +1,7 @@
-"""Shell 执行工具：继承当前进程的完整环境变量，支持超时和进程树清理。
+"""Shell 执行工具：继承当前进程的运行环境（已去掉密钥），支持超时和进程树清理。
 
 设计取舍：
-- 继承 os.environ（用户要求），因此 agent 的子进程能看到 PATH、HOME、API key 等；
+- 继承 PATH、HOME 等运行变量，但剥离 MINI_AGENT_API_KEY / ARK_API_KEY 等密钥；
 - Windows 上优先用 Git Bash（`bash.exe -lc`，自带 grep/sed/awk/find 等），
   找不到 Git Bash 才退回 cmd.exe；POSIX 上用 `sh -c`；
 - 命令不受限（能跑编译、测试、git），但 cwd 必须落在 workdir 内；
@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 from .base import FnTool, decode_output
+from ..envutil import sanitize_subprocess_env
 from ..store import project_data_dir
 
 DEFAULT_TIMEOUT = 60
@@ -261,8 +262,8 @@ class ShellTools:
         self.workdir = workdir.resolve()
         self.default_timeout = default_timeout
         self.hard_timeout = hard_timeout
-        # 显式拷贝一份，保证子进程拿到的是完整用户环境
-        self.env = dict(os.environ if env is None else env)
+        # 拷贝运行环境，但去掉 API key 等密钥，避免命令直接读到凭证
+        self.env = sanitize_subprocess_env(os.environ if env is None else env)
         # 统一 UTF-8：让子进程（尤其 python）也按 UTF-8 输出，解码端不用猜编码
         self.env["PYTHONIOENCODING"] = "utf-8"
         self.env["PYTHONUTF8"] = "1"
@@ -414,8 +415,9 @@ class ShellTools:
                     "执行 shell 命令并返回 exit code、耗时、stdout、stderr。"
                     "Windows 上默认跑在 Git Bash（标准 bash 语法：$VAR、; 分隔、$(...)、"
                     "管道和重定向齐全，grep/sed/awk/find 都可用）；找不到 Git Bash 时退回 cmd.exe。"
-                    "Linux/macOS 上是 sh。继承当前进程环境变量（PATH/HOME 等）。用于跑测试、"
-                    "编译、安装依赖、查看进程。非交互式，stdin 已关闭，不要用它跑 vim/top 之类交互程序。"
+                    "Linux/macOS 上是 sh。继承 PATH/HOME 等运行环境，但不传递 API key 等密钥。"
+                    "用于跑测试、编译、安装依赖、查看进程。非交互式，stdin 已关闭，"
+                    "不要用它跑 vim/top 之类交互程序。"
                 ),
                 parameters={
                     "type": "object",

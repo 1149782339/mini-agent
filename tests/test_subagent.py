@@ -2,7 +2,7 @@
 
 不需要 API key。真实端到端（父 agent 派 Task → 子进程跑真模型）见 smoke 或手动：
     uv run python -c \"...agent.run('用 Task ...')\"
-    uv run python examples/subagent_test.py
+    uv run pytest
 """
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 from mini_agent.config import Config  # noqa: E402
 from mini_agent.tools import build_tools  # noqa: E402
@@ -27,22 +26,14 @@ from mini_agent.tools.subagent import (  # noqa: E402
     truncate_result,
 )
 
-PASSED = FAILED = 0
-FAILURES: list[str] = []
 
 
-def check(name: str, cond: bool, detail: str = ""):
-    global PASSED, FAILED
-    if cond:
-        PASSED += 1
-        print(f"  ok  {name}")
-    else:
-        FAILED += 1
-        FAILURES.append(name)
-        print(f"  FAIL {name}  {detail}")
+def check(name: str, cond: bool, detail: str = "") -> None:
+    assert cond, f"{name}  {detail}"
 
 
-def main() -> bool:
+
+def test_subagent_suite() -> None:
     print("[build_child_argv]")
     argv = build_child_argv("做个任务", "/tmp/p.md")
     check("模块调用形态", argv[1:3] == ["-m", "mini_agent"], argv[:3])
@@ -131,12 +122,4 @@ def main() -> bool:
     check("子代理 prompt 含返回格式要求", "返回格式" in CHILD_SYSTEM_PROMPT)
     check("子代理 prompt 不含 Task 字样（防诱导）", "Task" not in CHILD_SYSTEM_PROMPT)
 
-    print("=" * 60)
-    print(f"PASS {PASSED}  FAIL {FAILED}")
-    if FAILURES:
-        print("失败用例:", ", ".join(FAILURES))
-    return FAILED == 0
 
-
-if __name__ == "__main__":
-    sys.exit(0 if main() else 1)

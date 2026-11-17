@@ -1,4 +1,10 @@
-"""冒烟测试：真实调用模型，验证工具闭环 + 压缩。"""
+"""集成冒烟测试：真实调用模型，验证工具闭环 + 压缩。
+
+需要可用的 API key（项目 .env 或 ~/.hermes/.env）。
+不纳入默认的 `uv run pytest`；请单独运行：
+
+    uv run python examples/smoke_test.py
+"""
 from __future__ import annotations
 
 import shutil

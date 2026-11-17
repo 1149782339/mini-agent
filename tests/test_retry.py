@@ -2,16 +2,14 @@
 
 不触网：monkeypatch 掉 openai client 的 chat.completions.create，
 按"剧本"依次抛异常或返回假流；time.sleep 打桩成空转。
-    uv run python examples/retry_test.py
+    uv run pytest
 """
 from __future__ import annotations
 
-import sys
 import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
 
 import types
 from openai import APIConnectionError, APIStatusError  # noqa: E402
@@ -27,24 +25,20 @@ from mini_agent.config import Config  # noqa: E402
 from mini_agent.loop import Agent  # noqa: E402
 from mini_agent.tools import build_tools  # noqa: E402
 
-client_mod.time.sleep = lambda _s: None  # 退避打桩，测试不真等
-
-PASSED = FAILED = 0
-FAILURES: list[str] = []
+import pytest
 
 
-def check(name: str, cond: bool, detail: str = ""):
-    global PASSED, FAILED
-    if cond:
-        PASSED += 1
-        print(f"  ok  {name}")
-    else:
-        FAILED += 1
-        FAILURES.append(name)
-        print(f"  FAIL {name}  {detail}")
+@pytest.fixture(autouse=True)
+def _fast_retries(monkeypatch):
+    """只在本模块测试期间打掉退避等待，并在结束后恢复，避免影响其他用例里的 time.sleep。"""
+    monkeypatch.setattr(client_mod.time, "sleep", lambda _s: None)
 
 
-# ---------- 假 API 组件 ----------
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    assert cond, f"{name}  {detail}"
+
+
 
 def make_stream(text: str = "你好") -> list:
     """一段正常流：内容 chunk + 收尾 usage chunk。"""
@@ -100,7 +94,7 @@ def status_400(message: str) -> APIStatusError:
     return APIStatusError(message, response=response, body=None)
 
 
-def main() -> bool:
+def test_retry_suite() -> None:
     print("[可重试错误：重试后成功]")
     notices: list[str] = []
     llm = make_llm_with_script([conn_error(), conn_error(), make_stream("世界")])
@@ -189,12 +183,4 @@ def main() -> bool:
     check("chat_stream 被调 2 次", fake.calls == 2, fake.calls)
     check("有溢出提示", any("压缩" in n for n in notices4), notices4)
 
-    print("=" * 60)
-    print(f"PASS {PASSED}  FAIL {FAILED}")
-    if FAILURES:
-        print("失败用例:", ", ".join(FAILURES))
-    return FAILED == 0
 
-
-if __name__ == "__main__":
-    sys.exit(0 if main() else 1)

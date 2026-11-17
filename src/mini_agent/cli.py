@@ -333,11 +333,11 @@ def main() -> None:
             print(f"ERROR: 会话不存在 {args.resume!r}，用 --list 查看已有会话")
             raise SystemExit(1)
         session_id = target
-        restored = store.message_count(session_id)
+        restored = store.view_message_count(session_id, system_prompt=SYSTEM_PROMPT)
     elif args.cont:
         session_id = store.latest()
         if session_id:
-            restored = store.message_count(session_id)
+            restored = store.view_message_count(session_id, system_prompt=SYSTEM_PROMPT)
 
     if session_id is None:
         session_id = store.create(model=cfg.model, workdir=str(cfg.workdir))
@@ -381,12 +381,17 @@ def main() -> None:
                   "  /log 压缩记录  /session 显示会话 ID  /quit 退出")
             continue
         if line == "/session":
-            print(f"{session_id}（{store.message_count(session_id)} 条消息）")
+            view_n = store.view_message_count(session_id, system_prompt=SYSTEM_PROMPT)
+            raw_n = store.message_count(session_id)
+            if raw_n > view_n:
+                print(f"{session_id}（当前视图 {view_n} 条，库中原文 {raw_n} 条）")
+            else:
+                print(f"{session_id}（{view_n} 条消息）")
             continue
         if line == "/clear":
             agent.ctx.reset()
-            store.replace(session_id, agent.ctx.messages)
-            print("历史已清空（数据库已同步）")
+            store.mark_clear(session_id)
+            print("历史已清空（原文仍保留在会话库中，当前视图已重置）")
             continue
         if line == "/tokens":
             size = agent.ctx.size(registry.schemas())
@@ -402,15 +407,14 @@ def main() -> None:
                 )
             continue
         if line == "/compact":
-            report = agent.ctx.compact(agent.llm, registry.schemas(), force=True)
+            report = agent.compact_now(force=True)
             if report:
-                store.replace(session_id, agent.ctx.messages)
-                print(f"已压缩: {report.before_tokens} → {report.after_tokens}（已写入会话）")
+                print(f"已压缩: {report.before_tokens} → {report.after_tokens}（已记录压缩，原文保留）")
             else:
                 print("无需压缩（历史太短）")
             continue
 
-        if store.message_count(session_id) == 0:
+        if store.current_user_message_count(session_id, system_prompt=SYSTEM_PROMPT) == 0:
             store.set_title(session_id, line[:40])
 
         printer.printed_content = False
