@@ -151,7 +151,8 @@ def run_print_mode(args, cfg, llm=None) -> int:
             print("ERROR: --tools 白名单没有匹配到任何工具")
             return 2
 
-    agent = Agent(cfg, registry, llm=llm)
+    # -p / 脚本 / Task 子代理：默认开硬停（没人盯着）
+    agent = Agent(cfg, registry, llm=llm, hard_stop_enabled=True)
     agent.ctx.messages = [{"role": "system", "content": system_prompt}]
 
     def _emit(event: dict) -> None:
@@ -348,6 +349,7 @@ def main() -> None:
         print(f"ERROR: {exc}")
         raise SystemExit(1)
     printer = StreamPrinter(color, cfg.show_reasoning)
+    # 交互式 CLI：默认只警告、不硬停，避免误伤正在盯着的调试
     agent = Agent(
         cfg,
         registry,
@@ -355,6 +357,7 @@ def main() -> None:
         on_delta=printer.delta,
         store=store,
         session_id=session_id,
+        hard_stop_enabled=False,
     )
 
     print(_c(f"mini-agent · {cfg.model}", "green", color))
