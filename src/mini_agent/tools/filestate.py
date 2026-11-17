@@ -133,7 +133,25 @@ class FileStateCache:
 
     def delete(self, path: Path) -> None:
         with self._lock:
-            self._entries.pop(self._key(path), None)
+            old = self._entries.pop(self._key(path), None)
+            if old is not None:
+                self._bytes -= len(old.content.encode("utf-8"))
+
+    def delete_tree(self, path: Path) -> None:
+        """删除该路径及其子路径上的读状态（供 RM/MV 递归清理）。"""
+        prefix = self._key(path)
+        seps = {os.sep}
+        if os.altsep:
+            seps.add(os.altsep)
+        with self._lock:
+            keys = [
+                key for key in self._entries
+                if key == prefix or any(key.startswith(prefix + sep) for sep in seps)
+            ]
+            for key in keys:
+                old = self._entries.pop(key, None)
+                if old is not None:
+                    self._bytes -= len(old.content.encode("utf-8"))
 
     def clear(self) -> None:
         with self._lock:

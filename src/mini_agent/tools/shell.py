@@ -4,7 +4,9 @@
 - 继承 PATH、HOME 等运行变量，但剥离 MINI_AGENT_API_KEY / ARK_API_KEY 等密钥；
 - Windows 上优先用 Git Bash（`bash.exe -lc`，自带 grep/sed/awk/find 等），
   找不到 Git Bash 才退回 cmd.exe；POSIX 上用 `sh -c`；
-- 命令不受限（能跑编译、测试、git），但 cwd 必须落在 workdir 内；
+- 命令大体不受限（能跑编译、测试、git），但 cwd 必须落在 workdir 内；
+- 直接调用 rm/mv（含 /bin/rm、/usr/bin/mv）会被拒绝，请改用 RM/MV 工具。
+  这是安全带，拦不住 python / find -delete / git rm 等绕法；
 - 超时杀整棵进程树：POSIX 杀进程组；Windows 优先用 Job Object，
   taskkill 作为兜底，避免子进程变成孤儿；
 - stdin 关闭，杜绝交互式命令把主循环挂死。
@@ -86,6 +88,94 @@ _NUL_REDIRECT_RE = re.compile(r"(\d?&?>+\s*)[Nn][Uu][Ll](?=\s|$|[|&;)\n])")
 def rewrite_windows_null_redirect(command: str) -> str:
     """把 cmd 风格的 `>nul` 重定向改写成 POSIX 的 `>/dev/null`。"""
     return _NUL_REDIRECT_RE.sub(r"\1/dev/null", command)
+
+
+# 直接调用 rm/mv 的安全带（不是锁）：只拦命令位置上的 rm/mv 及其绝对路径，
+# 不拦 git rm、find -delete、python os.remove、unlink，也不解析被引号包住的文本。
+_BLOCKED_BINARIES = {"rm", "mv"}
+_SHELL_SPLIT_RE = re.compile(r"(?:&&|\|\||[;|&\n`]|\$\()")
+_WRAPPERS = {"command", "exec", "time", "nohup", "nice", "env", "sudo"}
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _mask_quoted(command: str) -> str:
+    """把引号内的内容换成空格，避免 echo 'rm file' 被误判为调用 rm。"""
+    out: list[str] = []
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "'":
+            j = i + 1
+            while j < n and command[j] != "'":
+                j += 1
+            out.append(" " * (min(j, n - 1) - i + 1))
+            i = j + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if command[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if command[j] == '"':
+                    break
+                j += 1
+            out.append(" " * (min(j, n - 1) - i + 1))
+            i = j + 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append("  ")
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _command_name(token: str) -> str:
+    name = token.strip().strip("'\"")
+    name = os.path.basename(name.replace("\\", "/").rstrip("/")).lstrip("\\")
+    if os.name == "nt" and name.lower().endswith(".exe"):
+        name = name[:-4]
+        return name.lower()
+    return name
+
+
+def direct_rm_mv_invocation(command: str) -> str | None:
+    """若命令在命令位置直接调用 rm/mv（含 /bin/rm、/usr/bin/mv），返回该词；否则 None。"""
+    masked = _mask_quoted(command or "")
+    for part in _SHELL_SPLIT_RE.split(masked):
+        tokens = part.split()
+        i = 0
+        while i < len(tokens) and _ASSIGN_RE.match(tokens[i]):
+            i += 1
+        while i < len(tokens) and _command_name(tokens[i]).lower() in _WRAPPERS:
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 1
+        if i >= len(tokens):
+            continue
+        name = _command_name(tokens[i])
+        key = name.lower() if os.name == "nt" else name
+        if key in _BLOCKED_BINARIES:
+            return name
+    return None
+
+
+def _rm_mv_blocked_message(name: str) -> str:
+    tool = name.lower()
+    if tool == "rm":
+        return (
+            "ERROR: 禁止在 shell 里直接执行 rm（包括 /bin/rm、/usr/bin/rm）。"
+            "请改用 RM 工具：路径必须是工作目录内的字面绝对路径；"
+            "删除目录需显式 recursive=true。"
+        )
+    return (
+        "ERROR: 禁止在 shell 里直接执行 mv（包括 /bin/mv、/usr/bin/mv）。"
+        "请改用 MV 工具：路径必须是工作目录内的字面绝对路径；"
+        "目标已存在时拒绝覆盖。"
+    )
 
 
 if os.name == "nt":  # pragma: no cover - 仅 Windows
@@ -327,6 +417,9 @@ class ShellTools:
         command = (command or "").strip()
         if not command:
             return "ERROR: command 不能为空"
+        blocked = direct_rm_mv_invocation(command)
+        if blocked:
+            return _rm_mv_blocked_message(blocked)
         command = rewrite_windows_null_redirect(command)
 
         limit = int(timeout) if timeout else self.default_timeout
@@ -418,6 +511,8 @@ class ShellTools:
                     "Linux/macOS 上是 sh。继承 PATH/HOME 等运行环境，但不传递 API key 等密钥。"
                     "用于跑测试、编译、安装依赖、查看进程。非交互式，stdin 已关闭，"
                     "不要用它跑 vim/top 之类交互程序。"
+                    "不要在这里直接执行 rm 或 mv（包括 /bin/rm、/usr/bin/mv），请改用 RM 或 MV 工具；"
+                    "路径必须是工作目录内的字面绝对路径。这是安全带，不拦 python / find -delete / git rm 等绕法。"
                 ),
                 parameters={
                     "type": "object",

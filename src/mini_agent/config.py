@@ -130,6 +130,9 @@ FOOD_RICE
 - 列目录用 Ls，不要用 run_command 跑 ls。按名字找文件用 Glob，按内容找用 Grep。
 - 图片（jpg、png、gif、webp、bmp）用 Read 读取，不要用 run_command。
 - 修改已有文件前先读它；优先用 edit 做精确替换，而不是整文件重写。
+- 删除文件或目录用 RM，移动或重命名用 MV。路径必须是工作目录内的字面绝对路径
+  （不要用相对路径或 ~/xxx）。删除目录必须显式 recursive=true；
+  MV 不会覆盖已存在的目标。不要在 run_command 里直接执行 rm 或 mv。
 - run_command 在 Windows 上跑 Git Bash（标准 bash 语法：$VAR、; 分隔、$(...)、
   管道/重定向齐全，grep/sed/awk/find 都可用），Linux/macOS 上是 sh。
   按 bash 语法写命令，不要混用 cmd 的 %VAR%。

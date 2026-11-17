@@ -2,6 +2,10 @@
 
 - find_cut_point：从最新往回按 token 预算找切点；绝不切断 toolCall/toolResult 配对
   （切点绝不落在 tool 消息上，也绝不把 assistant(tool_calls) 和它的结果劈开）
+- prepare_compaction：在切点之上判断是否拆轮；切在一轮中间时分别给出
+  本轮之前的历史区间和本轮被切掉的前缀区间
+- build_turn_prefix_prompt / merge_split_summaries：当前轮前缀摘要模板，
+  与历史摘要合并到 Turn Context (split turn) 小节下
 - serialize_for_summary：把消息序列化成 [User]/[Assistant]/[Tool result] 标签文本
   再交给 LLM 摘要——防模型把摘要请求当对话续写；工具结果限 2000 字符、丢弃思维链
 - extract_file_operations：从工具调用参数里机械提取读过的/改过的文件清单，
@@ -11,6 +15,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from .tokens import content_image_count, content_text, message_tokens
 
@@ -20,7 +25,7 @@ SUMMARY_CONTENT_CHARS = 4000       # 摘要输入里单条 user/assistant 正文
 FILE_LIST_CAP = 200                # 文件清单最多列多少条
 
 TOOL_NAME_READ = {"Read", "Glob", "Grep", "Ls"}
-TOOL_NAME_MODIFY = {"Edit", "Write"}
+TOOL_NAME_MODIFY = {"Edit", "Write", "RM", "MV"}
 
 
 # ---------- 切点 ----------
@@ -61,6 +66,55 @@ def find_cut_point(messages: list[dict], keep_tokens: int) -> int:
             continue
         break
     return max(1, cut)
+
+
+@dataclass(frozen=True)
+class CutPlan:
+    """压缩切分方案。
+
+    cut: 保留起点，tail = messages[cut:]；system（下标 0）永不被切掉。
+    turn_start: 被切开的那一轮的用户消息下标；非拆轮时为 -1。
+    is_split_turn: 切点落在一轮中间（不是某条 user 消息上）。
+    """
+    cut: int
+    turn_start: int = -1
+    is_split_turn: bool = False
+
+    @property
+    def history_end(self) -> int:
+        return self.turn_start if self.is_split_turn else self.cut
+
+
+def is_turn_start(message: dict) -> bool:
+    """一轮从用户消息开始，直到下一条用户消息之前。"""
+    return message.get("role") == "user"
+
+
+def find_turn_start(messages: list[dict], index: int, start: int = 1) -> int:
+    """从 index 往回找到开启本轮的用户消息；找不到返回 -1。"""
+    for i in range(index, start - 1, -1):
+        if is_turn_start(messages[i]):
+            return i
+    return -1
+
+
+def prepare_compaction(messages: list[dict], keep_tokens: int) -> CutPlan:
+    """在 find_cut_point 之上判断切点是否落在一轮中间。
+
+    切在轮与轮的边界（tail 以 user 开头，或切点在末尾/无需压缩）时，
+    仍走单摘要。切在一轮中间时，历史摘要只覆盖本轮之前的消息，
+    本轮被切掉的前缀单独做一份前缀摘要，后缀保留原文。
+    """
+    cut = find_cut_point(messages, keep_tokens)
+    n = len(messages)
+    if cut >= n or cut <= 1:
+        return CutPlan(cut=cut)
+    if is_turn_start(messages[cut]):
+        return CutPlan(cut=cut)
+    turn_start = find_turn_start(messages, cut, start=1)
+    if turn_start == -1 or turn_start >= cut:
+        return CutPlan(cut=cut)
+    return CutPlan(cut=cut, turn_start=turn_start, is_split_turn=True)
 
 
 # ---------- 摘要输入序列化 ----------
@@ -124,7 +178,7 @@ def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]
     read_files: set[str] = set()
     modified_files: set[str] = set()
 
-    def _add(args_raw: str, bucket: set[str], keys: tuple[str, ...]) -> None:
+    def _add(args_raw: str, bucket: set[str], keys: tuple[str, ...], *, take_all: bool = False) -> None:
         try:
             args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
         except (json.JSONDecodeError, TypeError):
@@ -135,7 +189,8 @@ def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]
             value = args.get(key)
             if isinstance(value, str) and value.strip():
                 bucket.add(value.strip())
-                return
+                if not take_all:
+                    return
 
     for msg in messages:
         if msg.get("role") != "assistant":
@@ -147,7 +202,7 @@ def extract_file_operations(messages: list[dict]) -> tuple[list[str], list[str]]
             if name in TOOL_NAME_READ:
                 _add(args, read_files, ("file_path", "path", "pattern"))
             elif name in TOOL_NAME_MODIFY:
-                _add(args, modified_files, ("file_path",))
+                _add(args, modified_files, ("file_path", "path", "source", "destination"), take_all=True)
 
     return (
         sorted(read_files)[:FILE_LIST_CAP],
@@ -210,6 +265,37 @@ def build_summary_prompt(
     )
 
 
+TURN_PREFIX_SECTIONS = (
+    "## Original Request（用户在本轮的原始请求）\n"
+    "## Progress So Far（本轮前缀里已经完成的工作和关键决策）\n"
+    "## Context Needed to Continue（理解保留下来的后缀还需要的上下文）"
+)
+
+
+def build_turn_prefix_prompt(serialized: str) -> str:
+    """被切开的当前轮前缀摘要 prompt。只覆盖前缀，不推断后缀里的内容。"""
+    return (
+        "下面是一轮对话里已经被切开、不会再以原文形式保留的前缀。"
+        "这一轮后面的消息会原样保留，不必复原或推测它们。\n"
+        "请写一份简短的检查点摘要，让另一个 AI 在看到后缀原文之前，"
+        "先弄清用户的请求和前缀里已经发生的进展。\n"
+        "硬性要求：\n"
+        "- 只输出摘要本身：不要调用任何工具，不要寒暄，不要复述本指令。\n"
+        "- 只写前缀里真实出现过的内容，禁止编造或推断后面的消息。\n"
+        "- 严格遵守下面的小节结构（markdown 标题）：\n"
+        f"{TURN_PREFIX_SECTIONS}\n"
+        "- 如果某项没有内容，写「无」。\n"
+        f"<对话>\n{serialized}\n</对话>"
+    )
+
+
+def merge_split_summaries(history_text: str, turn_prefix_text: str) -> str:
+    """把历史摘要和当前轮前缀摘要合成一份，前缀放在 Turn Context 小节下。"""
+    history = history_text.strip() or "无更早历史。"
+    prefix = turn_prefix_text.strip()
+    return f"{history}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}"
+
+
 def append_file_lists(summary: str, read_files: list[str],
                       modified_files: list[str]) -> str:
     """把文件清单确定性附加到摘要末尾（不进 LLM 自由发挥范围）。"""
@@ -223,8 +309,11 @@ def append_file_lists(summary: str, read_files: list[str],
     return summary.rstrip() + ("\n\n" + "\n".join(blocks) if blocks else "")
 
 
-def looks_like_bad_summary(text: str) -> bool:
-    """摘要质量闸：拒收明显坏掉的摘要。"""
+def looks_like_bad_summary(text: str, min_length: int = 80) -> bool:
+    """摘要质量闸：拒收明显坏掉的摘要。
+
+    当前轮前缀摘要本来就更短，调用方可把 min_length 调低（默认仍是 80）。
+    """
     stripped = text.strip()
     if not stripped:
         return True
@@ -235,7 +324,7 @@ def looks_like_bad_summary(text: str) -> bool:
         return True
     if "<tool_call" in stripped or "Action:" in stripped[:200]:
         return True
-    # 太短 = 基本没干活（正常摘要至少几百字）
-    if len(stripped) < 80:
+    # 太短 = 基本没干活（正常历史摘要至少几十到几百字）
+    if len(stripped) < min_length:
         return True
     return False

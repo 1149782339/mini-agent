@@ -108,9 +108,11 @@ def test_context_suite() -> None:
             {"id": "b", "function": {"name": "Grep", "arguments": '{"path": "src", "pattern": "x"}'}},
             {"id": "c", "function": {"name": "Write", "arguments": '{"file_path": "w1.py"}'}},
             {"id": "d", "function": {"name": "Edit", "arguments": '{broken json'}},
+            {"id": "e", "function": {"name": "RM", "arguments": '{"path": "old.txt"}'}},
+            {"id": "f", "function": {"name": "MV", "arguments": '{"source": "a.txt", "destination": "b.txt"}'}},
         ]},
     ])
-    check("读取/修改分类正确", rf == ["r1.py", "src"] and mf == ["w1.py"], f"{rf} {mf}")
+    check("读取/修改分类正确", rf == ["r1.py", "src"] and mf == ["a.txt", "b.txt", "old.txt", "w1.py"], f"{rf} {mf}")
 
     print("[build_summary_prompt]")
     p = build_summary_prompt("对话文本", previous_summary="旧摘要ABC",
@@ -149,7 +151,7 @@ def test_context_suite() -> None:
     ctx = Context(cfg)
     ctx.messages = history(8, filler_len=300)
 
-    llm = FakeLLM(["## Goal\n修Bug " * 40])
+    llm = FakeLLM(["## Goal\n修Bug " * 40, "## Original Request\n修Bug " * 20])
     report = ctx.compact(llm)
     check("压缩执行", report is not None and report.summarised, report)
     check("摘要替换头部", ctx.messages[1]["content"].startswith(COMPACTION_MARKER))
@@ -161,7 +163,7 @@ def test_context_suite() -> None:
     for _ in range(6):
         ctx.add({"role": "user", "content": "更多 " * 300})
         ctx.add({"role": "assistant", "content": "答 " * 300})
-    llm2 = FakeLLM(["## Goal\n继续修 " * 40])
+    llm2 = FakeLLM(["## Goal\n继续修 " * 40, "## Original Request\n继续修 " * 20])
     ctx.compact(llm2)
     check("二次压缩走更新模式", "<旧摘要>" in llm2.prompts[0])
 

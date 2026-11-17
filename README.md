@@ -1,7 +1,7 @@
 # mini-agent
 
 一个能真跑的编码代理：工具调用闭环、上下文自动压缩、SQLite 会话。
-核心代码在 `src/mini_agent/`，约 5100 行。依赖 `openai`、`pillow`、`python-dotenv`、`rich`，
+核心代码在 `src/mini_agent/`，约 6000 行。依赖 `openai`、`pillow`、`python-dotenv`、`rich`，
 需要 Python ≥ 3.13，用 uv 管理（`uv run mini-agent`）。
 
 ## 快速开始
@@ -59,7 +59,7 @@ REPL 命令：`/help` `/clear` `/compact` `/tokens` `/log` `/session` `/quit`
 `is_concurrency_safe` 默认 false。失败信息即自愈指引，并带 errorCode。
 
 文件工具共享一个读状态缓存。读写不对称：**Read / Ls / Glob / Grep 可以读机器上任意路径**
-（相对路径基于工作目录解析）；**Edit / Write 必须落在工作目录内**。
+（相对路径基于工作目录解析）；**Edit / Write / RM / MV 必须落在工作目录内**。RM / MV 还要求路径是字面绝对路径。
 UNC 路径（`\\server\share`）在任何文件系统调用之前拒绝——Windows 对 UNC 做
 stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 
@@ -75,6 +75,8 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
   `replace_all`。直引号可以匹配弯引号，写回时还原原风格。按原编码和行尾写回
   （CRLF / UTF-16 不会被改成 LF）。`.md` 行尾的两个空格不参与匹配。
 - **Write**：新建或整文件覆盖。覆盖已存在的文件前必须先 Read。内容原样写入。
+- **RM**：删除工作目录内的文件或目录。路径必须是字面绝对路径，相对路径和 `~/xxx` 一律拒绝，不会先展开再判断。解析软链接后仍须落在工作目录内，也禁止删除工作目录本身。默认不递归，删除目录必须显式 `recursive=true`。
+- **MV**：移动或重命名工作目录内的文件或目录。`source` 和 `destination` 都必须是字面绝对路径，且 resolve 后仍在工作目录内，禁止移动工作目录本身。`destination` 必须是最终路径；若已存在则拒绝覆盖。
 - **Ls**：列一层目录。目录名以 `/` 结尾，目录在前。默认跳过以 `.` 开头的项，`all=true` 可显示。最多 200 项。
 - **Glob**：`rg --files` 按文件名找文件，修改时间新的在前，最多 100 条。
 - **Grep**：ripgrep 的 content / files_with_matches / count，以及
@@ -94,7 +96,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 （跳过隐藏文件、尊重 `.gitignore`）。`MINI_AGENT_RG_ALL=1` 改为搜索隐藏文件并忽略 gitignore。
 
 同一轮按 `tool_calls` 的顺序执行。连续的 `is_concurrency_safe()` 工具
-（Read / Ls / Glob / Grep / Task）并行，最多 4 个线程。Edit、Write、`run_command`
+（Read / Ls / Glob / Grep / Task）并行，最多 4 个线程。Edit、Write、RM、MV、`run_command`
 是屏障，在主线程按原顺序执行，所以「先改文件再跑测试」不会把测试跑到修改前面。
 同一路径的写入还有一把互斥锁。`finish_reason=length` 时工具参数视为被截断，
 不执行，回一条合成错误让模型把输出拆小。Ctrl+C 会给还没回填的 `tool_call`
@@ -125,6 +127,7 @@ src/mini_agent/
     ├── image.py       # 图片魔数、缩放、bmp 转 png
     ├── edit.py        # Edit
     ├── write.py       # Write
+    ├── rm_mv.py       # RM / MV
     ├── glob_tool.py   # Glob（rg --files）
     ├── grep_tool.py   # Grep
     ├── ls.py          # Ls
@@ -144,10 +147,15 @@ src/mini_agent/
    （默认 100 万 × 0.7）。
 3. **切分**。从最新消息往回累加，凑满 `keep_recent_tokens`（默认 20000；
    小窗口会收缩，且不超过压缩阈值的一半）即停。切点不拆开 tool call 和 tool result。
-4. **摘要**。被切掉的头部先变成 `[User]` / `[Assistant]` / `[Tool result]` 标签文本
-   （思维链丢弃，单条工具结果限 2000 字符），再让模型按六节写：
+   若切点落在一轮中间（某条 user 之后的 assistant / tool 上），不会把这一轮的前半段
+   塞进同一份总摘要。
+4. **摘要**。切在轮与轮的边界时，被切掉的头部变成 `[User]` / `[Assistant]` /
+   `[Tool result]` 标签文本（思维链丢弃，单条工具结果限 2000 字符），再让模型按六节写：
    Goal、Constraints、Progress、Key Decisions、Next Steps、Critical Context。
-   已有旧摘要时走更新合并。
+   已有旧摘要时走更新合并。切在一轮中间时，先写本轮之前的历史摘要，再单独写被切开的
+   这一轮前缀摘要（原请求、已有进展、理解后缀还需要的上下文），合并到
+   `Turn Context (split turn)` 小节下；这一轮的后缀仍保留原文。任一份摘要被质量闸拒收
+   或调用失败，都整段改走机械裁剪，不会只留下一半摘要。
 5. **文件清单**。`<read-files>` / `<modified-files>` 从工具参数机械提取，
    附在摘要尾部，跨次压缩随摘要文本累积。
 6. **质量闸**。摘要为空、`finish_reason=length`，或看起来像续写 / 报错，就拒收，
@@ -159,7 +167,7 @@ src/mini_agent/
 
 provider 返回上下文过长时，主循环强制压缩并重试这一轮恰好一次。
 
-还没有 split-turn 双摘要、分支摘要、分支事件树。
+还没有分支摘要、分支事件树。
 压缩和 `/clear` 都只改发给模型的视图，SQLite 里的原文仍在，resume 时按最近一次压缩/清空重建视图。极长会话会多次压缩，模型侧细节会丢，但磁盘上可以回看原文。
 
 ## 配置
@@ -177,7 +185,7 @@ provider 返回上下文过长时，主循环强制压缩并重试这一轮恰�
 | `MINI_AGENT_MAX_OUTPUT_TOKENS` | `32768` | 单次输出预算（思维链、正文、工具参数共享）。太小会被 `length` 截断 |
 | `MINI_AGENT_MAX_STEPS` | `40` | 单轮最大工具步数。子代理进程内被设为 150 |
 | `MINI_AGENT_KEEP_RECENT_TOKENS` | `20000` | 压缩时尾部保留的 token |
-| `MINI_AGENT_WORKDIR` | `.` | Edit/Write 与 `run_command` 的 cwd 限制在此目录。Read/Glob/Grep 可读任意路径 |
+| `MINI_AGENT_WORKDIR` | `.` | Edit/Write/RM/MV 与 `run_command` 的 cwd 限制在此目录。Read/Glob/Grep 可读任意路径 |
 | `MINI_AGENT_ENABLE_SHELL` | `1` | `0` / `false` / `no` / `off` 关闭 `run_command` |
 | `MINI_AGENT_ENABLE_SUBAGENT` | `1` | 同上，关闭 Task。print 模式始终不注册 Task |
 | `MINI_AGENT_SHELL` | `auto` | `auto` / `gitbash` / `cmd` |
@@ -243,9 +251,15 @@ uv run python examples/smoke_test.py      # 工具闭环 + 真实压缩
 
 - Edit / Write 的路径 `resolve()` 之后必须在 `workdir` 内，`../` 越界直接拒绝。
   Read / Glob / Grep 只读，不设范围。
+- RM / MV 的路径必须是字面绝对路径（相对路径和 `~/xxx` 直接拒绝，不会先展开再接受）。
+  解析软链接后仍须落在 `workdir` 内，禁止操作工作目录本身。
+  RM 默认不递归，删除目录必须 `recursive=true`。MV 在目标已存在时拒绝覆盖。
 - Edit / Write 修改已存在文件前，本会话必须 Read 过它，且磁盘未被外部改过。
 - UNC 路径不做任何文件系统操作。设备文件（如 `/dev/zero`）在黑名单里。
-- `run_command` 的 cwd 受 `workdir` 约束。命令本身没有白名单。
+- `run_command` 的 cwd 受 `workdir` 约束。命令没有完整白名单，但会拒绝直接调用
+  `rm`、`mv`（包括 `/bin/rm`、`/usr/bin/mv`），请改用 RM / MV。这是安全带，
+  拦不住 `python` 删文件、`find -delete`、`unlink`、`git rm` 或把 `rm` 写进脚本；
+  用 Write / Edit 写含 `rm` 的清理脚本仍然允许。
 - `run_command` 继承 `PATH`、`HOME` 等运行环境，但不传递 `MINI_AGENT_API_KEY`、`ARK_API_KEY` 以及其他常见密钥变量。
   Task 子代理同样不继承这些密钥；子进程启动时由 `load_config()` 自行读取项目 `.env` 或 `~/.hermes/.env`。
   如果密钥只存在于父进程环境、文件里没有，子代理会因缺少 API key 而失败。
