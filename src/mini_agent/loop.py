@@ -1,4 +1,9 @@
-"""Agent 主循环：请求 → 工具调用 → 回填结果 → 再请求，直到没有工具调用。"""
+"""Agent 主循环：请求 → 工具调用 → 回填结果 → 再请求，直到没有工具调用。
+
+每轮用户输入开始时重置 StallGuard。执行前询问 before_call（可拦截），
+写回 tool 消息前走 after_call / observe_call（短引用、提示）；一批结果
+写完后若已硬停，不再进入下一轮模型请求。不取代 max_steps 和溢出压缩。
+"""
 from __future__ import annotations
 
 from typing import Callable
@@ -6,6 +11,7 @@ from typing import Callable
 from .client import ContextOverflowError, LLM, LLMError
 from .config import Config
 from .context import Context
+from .guardrails import StallGuard, is_tool_failure, parse_tool_arguments
 from .tools import ToolRegistry
 from .tools.base import ExecutedTool
 
@@ -63,12 +69,15 @@ class Agent:
         store=None,
         session_id: str | None = None,
         on_delta: Callable[[str, str], None] | None = None,
+        hard_stop_enabled: bool = False,
     ):
         self.cfg = cfg
         self.registry = registry
         self.llm = llm or LLM(cfg)
         self.on_event = on_event or _noop
         self.on_delta = on_delta
+        self.hard_stop_enabled = hard_stop_enabled
+        self.guardrails = StallGuard(hard_stop_enabled=hard_stop_enabled)
         self.ctx = Context(cfg)
         self.store = store
         self.session_id = session_id
@@ -138,10 +147,33 @@ class Agent:
                 self._dispatch_parallel(calls, idxs, results)
 
     def _dispatch_one(self, call: dict) -> ExecutedTool:
-        return self.registry.execute(
-            _call_name(call),
-            call.get("function", {}).get("arguments", "{}"),
-        )
+        name = _call_name(call)
+        raw_args = call.get("function", {}).get("arguments", "{}")
+        decision = self.guardrails.before_call(name, parse_tool_arguments(raw_args))
+        if not decision.allows_execution:
+            return ExecutedTool(decision.synthetic_error)
+        return self.registry.execute(name, raw_args)
+
+    def _apply_guardrails(self, call: dict, result: ExecutedTool) -> ExecutedTool:
+        """写回历史前：按需换成短引用、追加提示。多模态结果不进入相同调用盯梢。"""
+        name = _call_name(call)
+        args = parse_tool_arguments(call.get("function", {}).get("arguments", "{}"))
+        text = result.text or ""
+        failed = is_tool_failure(name, text)
+        decision = self.guardrails.after_call(name, args, text, failed=failed)
+        if result.images:
+            observation = self.guardrails.observe_call(name, args, None, failed=failed)
+        else:
+            observation = self.guardrails.observe_call(
+                name, args, text, failed=failed, tool_call_id=call.get("id", ""),
+            )
+        new_text = observation.stub if observation.stub else text
+        for extra in (observation.notice, decision.message if decision.action in {"warn", "halt"} else None):
+            if extra and extra not in new_text:
+                new_text = f"{new_text}\n\n{extra}" if new_text else extra
+        if new_text == result.text:
+            return result
+        return ExecutedTool(new_text, list(result.images))
 
     def _dispatch_parallel(
         self, calls: list[dict], idxs: list[int], results: list[ExecutedTool | None]
@@ -187,6 +219,7 @@ class Agent:
             return ""
 
         on_event = _event_override or self.on_event
+        self.guardrails.reset()
         self._add({"role": "user", "content": text})
 
         for step in range(1, self.cfg.max_steps + 1):
@@ -263,7 +296,9 @@ class Agent:
                         else "ERROR: 工具未返回结果"
                     )
             for call, result in zip(calls, results):
-                done = result or ExecutedTool("ERROR: 工具未返回结果")
+                done = self._apply_guardrails(
+                    call, result or ExecutedTool("ERROR: 工具未返回结果")
+                )
                 on_event("tool_result", {
                     "name": _call_name(call),
                     "result": _result_preview(done),
@@ -277,6 +312,10 @@ class Agent:
                 )
             if interrupted:
                 raise KeyboardInterrupt
+            if self.guardrails.should_halt():
+                msg = self.guardrails.halt_message()
+                on_event("notice", {"message": msg})
+                return msg
 
         on_event("error", {"message": "达到最大工具步数"})
         return f"（达到最大工具步数 {self.cfg.max_steps}，已停止）"
