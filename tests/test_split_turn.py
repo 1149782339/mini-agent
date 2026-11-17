@@ -232,7 +232,9 @@ def test_split_turn_keeps_originals_in_sqlite(tmp_path: Path) -> None:
         store.append(sid, msg)
     raw_n = store.message_count(sid)
 
-    cfg = mid_turn_cfg(400)
+    # 窗口略放大：工具 schema（含 RM/MV）会计入压缩阈值。
+    # 8000×0.5 时第一次拆轮摘要后可能仍略超阈值，第二次压缩会盖掉拆轮标记。
+    cfg = mid_turn_cfg(400, context_window=10000)
     cfg.workdir = tmp_path
     cfg.enable_shell = False
     cfg.enable_subagent = False
