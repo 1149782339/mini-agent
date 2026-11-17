@@ -149,7 +149,7 @@ def test_context_suite() -> None:
     ctx = Context(cfg)
     ctx.messages = history(8, filler_len=300)
 
-    llm = FakeLLM(["## Goal\n修Bug " * 40])
+    llm = FakeLLM(["## Goal\n修Bug " * 40, "## Original Request\n修Bug " * 20])
     report = ctx.compact(llm)
     check("压缩执行", report is not None and report.summarised, report)
     check("摘要替换头部", ctx.messages[1]["content"].startswith(COMPACTION_MARKER))
@@ -161,7 +161,7 @@ def test_context_suite() -> None:
     for _ in range(6):
         ctx.add({"role": "user", "content": "更多 " * 300})
         ctx.add({"role": "assistant", "content": "答 " * 300})
-    llm2 = FakeLLM(["## Goal\n继续修 " * 40])
+    llm2 = FakeLLM(["## Goal\n继续修 " * 40, "## Original Request\n继续修 " * 20])
     ctx.compact(llm2)
     check("二次压缩走更新模式", "<旧摘要>" in llm2.prompts[0])
 
