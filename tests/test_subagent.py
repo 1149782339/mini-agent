@@ -13,13 +13,18 @@ import time
 import types
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 from mini_agent.config import Config  # noqa: E402
-from mini_agent.tools import build_tools  # noqa: E402
+from mini_agent.jobs import TaskRegistry  # noqa: E402
+from mini_agent.tools import ToolContext, ToolOutput, build_tools  # noqa: E402
+from mini_agent.tools.base import ToolError  # noqa: E402
 from mini_agent.tools.subagent import (  # noqa: E402
     CHILD_SYSTEM_PROMPT,
     ProcessTimeout,
+    SubagentTool,
     build_child_argv,
     collect_stdout,
     parse_json_events,
@@ -78,6 +83,7 @@ def test_subagent_suite() -> None:
     print("[注册开关]")
     reg = build_tools(Config(workdir=ROOT, enable_shell=True, enable_subagent=True))
     check("默认注册 Task", "Task" in reg.names(), reg.names())
+    check("默认注册统一 task_manage", "task_manage" in reg.names(), reg.names())
     reg2 = build_tools(Config(workdir=ROOT, enable_shell=False, enable_subagent=False))
     check("enable_subagent=False 不注册", "Task" not in reg2.names(), reg2.names())
     # print 模式的防递归摘除（与 cli.run_print_mode 同款逻辑）
@@ -121,5 +127,86 @@ def test_subagent_suite() -> None:
     print("[子代理 system prompt  sanity]")
     check("子代理 prompt 含返回格式要求", "返回格式" in CHILD_SYSTEM_PROMPT)
     check("子代理 prompt 不含 Task 字样（防诱导）", "Task" not in CHILD_SYSTEM_PROMPT)
+
+
+def test_background_subagent_fast_completion_and_sync_compat(tmp_path, monkeypatch) -> None:
+    jobs = TaskRegistry()
+    tool = SubagentTool(jobs=jobs)
+    ctx = ToolContext(tmp_path)
+    ctx.session_id = "session-a"
+    seen = []
+    jobs.on_complete(seen.append)
+
+    def fake_execute(task, timeout, ctx, tag, hook, job):
+        return ToolOutput(f"result:{task}", {"type": "subagent", "tag": tag})
+
+    monkeypatch.setattr(tool, "_execute", fake_execute)
+    started = tool.call({"prompt": "background", "run_in_background": True}, ctx)
+    task_id = started.meta["task_id"]
+    assert "已启动后台子代理" in started.text
+    job = jobs.get(task_id)
+    assert job is not None
+    assert job.done.wait(timeout=2)
+    deadline = time.monotonic() + 2
+    while not seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(seen) == 1
+    assert job.owner_session_id == "session-a"
+    assert job.delivery == "wake"
+
+    # get 不消费；终态 output 消费后，排队中的自动通知失效。
+    jobs.task_manage("get", task_id, owner_session_id="session-a")
+    assert job.notification_state == "pending"
+    output = jobs.task_manage("output", task_id, owner_session_id="session-a")
+    assert "result:background" in output
+    assert jobs.consume_notification(seen[0]) is None
+
+    synchronous = tool.call({"prompt": "sync"}, ctx)
+    assert synchronous.text == "result:sync"
+    assert synchronous.meta["task_id"] != task_id
+    assert len(seen) == 1  # 同步 Task 不产生后台通知
+
+
+def test_print_mode_rejects_background_without_starting(tmp_path, monkeypatch) -> None:
+    jobs = TaskRegistry(allow_notify=False)
+    jobs.allow_background_subagents = False
+    tool = SubagentTool(jobs=jobs)
+    monkeypatch.setattr(
+        tool,
+        "_execute",
+        lambda *args: (_ for _ in ()).throw(AssertionError("不应启动执行器")),
+    )
+    with pytest.raises(ToolError) as exc_info:
+        tool.call(
+            {"prompt": "not-allowed", "run_in_background": True},
+            ToolContext(tmp_path),
+        )
+    assert exc_info.value.error_code == 24
+    assert "使用同步 Task" in str(exc_info.value)
+    assert jobs.all_jobs() == []
+
+
+def test_background_subagent_runs_real_process_protocol(tmp_path, monkeypatch) -> None:
+    # 不调用模型：用真实 Python 子进程模拟 mini-agent 的 JSONL result 事件。
+    child_code = "print('{\"type\": \"result\", \"result\": \"process-done\"}')"
+    monkeypatch.setattr(
+        "mini_agent.tools.subagent.build_child_argv",
+        lambda _task, _prompt_file: [sys.executable, "-c", child_code],
+    )
+    jobs = TaskRegistry()
+    tool = SubagentTool(jobs=jobs)
+    started = tool.call(
+        {"prompt": "real-process", "run_in_background": True, "timeout": 60},
+        ToolContext(tmp_path),
+    )
+    task_id = started.meta["task_id"]
+    job = jobs.get(task_id)
+    assert job is not None
+    assert job.done.wait(timeout=5)
+    assert job.exit_code == 0
+    assert not job.error
+    output = jobs.task_manage("output", task_id)
+    assert "process-done" in output
+    assert job.meta["type"] == "subagent"
 
 

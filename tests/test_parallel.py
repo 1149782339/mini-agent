@@ -273,3 +273,74 @@ def test_parallel_suite() -> None:
           SubagentTool().is_concurrency_safe() is True)
 
 
+def test_busy_agent_injects_completion_after_tool_results(tmp_path: Path) -> None:
+    from mini_agent.jobs import TaskRegistry
+
+    jobs = TaskRegistry()
+    registry = ToolRegistry(context=ToolContext(tmp_path))
+    registry.jobs = jobs
+
+    class StartBackground(Tool):
+        name = "start_background"
+        description = "启动一个会立即完成的任务"
+        parameters = {"type": "object", "properties": {}, "additionalProperties": False}
+
+        def call(self, args, ctx) -> ToolOutput:
+            job = jobs.add_task(
+                lambda _job: ToolOutput("background-done"),
+                command="demo",
+                cwd=tmp_path,
+                kind="subagent",
+                delivery="wake",
+            )
+            assert job.done.wait(timeout=2)
+            # worker 已结束，但在 tool 结果补齐前不得直接写父会话。
+            assert all(
+                "background-done" not in str(message)
+                for message in agent.ctx.messages
+            )
+            return ToolOutput(f"started:{job.job_id}")
+
+    class TwoStepLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.seen: list[list[dict]] = []
+
+        def chat_stream(self, messages, tools=None, on_delta=None, on_notice=None):
+            self.calls += 1
+            self.seen.append([dict(message) for message in messages])
+            if self.calls == 1:
+                return {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [batch_call("bg", "start_background")],
+                    "_finish_reason": "tool_calls", "_usage": {},
+                }
+            return {
+                "role": "assistant", "content": "已收到后台结果",
+                "_finish_reason": "stop", "_usage": {},
+            }
+
+        def summarize(self, prompt):
+            return "摘要"
+
+    registry.register(StartBackground())
+    llm = TwoStepLLM()
+    agent = Agent(Config(workdir=tmp_path), registry, llm=llm, session_id="busy")
+    assert agent.run("开始") == "已收到后台结果"
+
+    second_request = llm.seen[1]
+    tool_index = next(
+        i for i, message in enumerate(second_request)
+        if message.get("role") == "tool" and message.get("tool_call_id") == "bg"
+    )
+    injected = second_request[tool_index + 1]
+    assert injected["role"] == "user"
+    assert "background-done" in injected["content"]
+    assert sum(
+        "background-done" in str(message.get("content", ""))
+        and message.get("role") == "user"
+        for message in agent.ctx.messages
+    ) == 1
+    assert not agent.ctx.validate()
+
+

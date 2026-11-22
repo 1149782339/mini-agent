@@ -145,6 +145,7 @@ def run_print_mode(args, cfg, llm=None) -> int:
     jobs = getattr(registry, "jobs", None)
     if jobs is not None:
         jobs.allow_notify = False
+        jobs.allow_background_subagents = False
     # 防递归：print 模式永不提供 Task，子代理不能再派子代理
     registry.tools.pop("Task", None)
     if args.tools:
@@ -291,7 +292,8 @@ class InteractiveSession:
 
     输入在独立线程读取（Windows 控制台不能靠 POSIX select 盯 stdin）。
     一轮进行中到达的完成通知或下一条用户输入会排队，结束后再处理。
-    完成通知只把退出码和输出汇报给用户并写入会话，不自动再开一轮 Agent.run。
+    Shell 完成通知只汇报并记录；后台 Subagent 在空闲时会唤醒 Agent.run。
+    忙碌期间由 Agent 在工具结果补齐后的下一 LLM step 前注入，重复事件会丢弃。
     退出或 Ctrl+C 离开 REPL 时清掉仍在跑的后台进程。
     """
 
@@ -396,17 +398,25 @@ class InteractiveSession:
         return None
 
     def _handle_completion(self, completion) -> None:
+        # 忙碌注入、显式 task_manage 或这里的空闲处理，只有一个能消费。
+        if self.jobs is not None:
+            completion = self.jobs.consume_notification(completion)
+            if completion is None:
+                return
         print()
         print(_c(f"后台任务 {completion.job_id} 已结束：", "yellow", self.color))
         print(completion.message)
+        notice = completion.message or ""
+        if completion.delivery == "wake":
+            print(_c("结果已送回 Agent，继续处理当前任务。", "yellow", self.color))
+            print()
+            if self.agent is not None:
+                self._run_agent(notice)
+            return
         print(_c("结果已记录，下一步等你说了再做。", "yellow", self.color))
         print()
-        notice = completion.message or ""
         if "不要自动开始下一步" not in notice:
-            notice = (
-                notice
-                + "\n\n（以上是后台任务结果，已向用户汇报。请等待用户指示，不要自动开始下一步。）"
-            )
+            notice += "\n\n（以上是后台任务结果，已向用户汇报。请等待用户指示，不要自动开始下一步。）"
         if self.agent is not None:
             self.agent.record_event(notice)
 

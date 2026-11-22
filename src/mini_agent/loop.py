@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from collections import deque
+import threading
 from typing import Callable
 
 from .client import ContextOverflowError, LLM, LLMError
@@ -81,6 +83,11 @@ class Agent:
         self.ctx = Context(cfg)
         self.store = store
         self.session_id = session_id
+        self.jobs = getattr(registry, "jobs", None)
+        self._pending_completions = deque()
+        self._completion_lock = threading.Lock()
+        if self.jobs is not None:
+            self.jobs.on_complete(self._on_job_complete)
         if store is not None and session_id:
             view = store.load_view(session_id, system_prompt=self.ctx.system_prompt)
             # 新会话视图只有注入的 system，与 Context 默认值一致
@@ -89,6 +96,7 @@ class Agent:
         # 工具执行期上报通道（Task 子代理进度等）；挂在共享 context 上，worker 线程可用
         if self.registry.context is not None:
             self.registry.context.event_hook = self.on_event
+            self.registry.context.session_id = session_id
 
     # ---------- 历史写入（内存 + 磁盘同步）----------
     def _add(self, message: dict) -> None:
@@ -210,6 +218,29 @@ class Agent:
             " Write（每个 ≤100 行），或减少不必要的推理长度。"
         )
 
+    def _on_job_complete(self, completion) -> None:
+        """任务 worker 只入队；不得在这里写 Context、Store 或调用 run。"""
+        with self._completion_lock:
+            self._pending_completions.append(completion)
+
+    def _drain_completions(self) -> None:
+        """在安全的 LLM step 边界消费通知，重复/已显式读取的事件直接丢弃。"""
+        while True:
+            with self._completion_lock:
+                if not self._pending_completions:
+                    return
+                completion = self._pending_completions.popleft()
+            if self.jobs is not None:
+                completion = self.jobs.consume_notification(completion)
+                if completion is None:
+                    continue
+            notice = (completion.message or "").strip()
+            if not notice:
+                continue
+            if completion.delivery == "wake":
+                notice += "\n\n（以上是后台 Subagent 的完成结果，请结合当前任务继续处理。）"
+            self.record_event(notice)
+
     def record_event(self, text: str) -> None:
         """把一条通知写入会话历史，不发起模型轮次。"""
         text = (text or "").strip()
@@ -228,6 +259,7 @@ class Agent:
         on_event = _event_override or self.on_event
         self.guardrails.reset()
         self._add({"role": "user", "content": text})
+        self._drain_completions()
 
         for step in range(1, self.cfg.max_steps + 1):
             self._compact_if_needed()
@@ -323,6 +355,8 @@ class Agent:
                 msg = self.guardrails.halt_message()
                 on_event("notice", {"message": msg})
                 return msg
+            # 所有 tool_call 的结果已补齐；此刻注入不会破坏 tool 消息配对。
+            self._drain_completions()
 
         on_event("error", {"message": "达到最大工具步数"})
         return f"（达到最大工具步数 {self.cfg.max_steps}，已停止）"

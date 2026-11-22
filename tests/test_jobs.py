@@ -5,8 +5,10 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from mini_agent.cli import InteractiveSession
-from mini_agent.jobs import JobCompletion, JobRegistry
+from mini_agent.jobs import JobCompletion, JobRegistry, TaskLimitError, TaskRegistry
 from mini_agent.tools.shell import ShellTools
 
 
@@ -232,3 +234,152 @@ def test_completion_is_queued_during_a_run(tmp_path: Path) -> None:
     finally:
         session.submit("eof", None)
         thread.join(timeout=2)
+
+
+def test_task_notice_has_only_one_consumer(tmp_path: Path) -> None:
+    jobs = TaskRegistry()
+    seen: list[JobCompletion] = []
+    jobs.on_complete(seen.append)
+    job = jobs.add_task(
+        lambda _job: "task-result",
+        command="demo",
+        cwd=tmp_path,
+        owner_session_id="owner-a",
+        delivery="wake",
+    )
+    assert job.done.wait(timeout=2)
+    assert len(seen) == 1
+
+    # get 是无副作用读取，不能抢走自动通知。
+    assert "task-result" in jobs.task_manage(
+        "get", job.job_id, owner_session_id="owner-a"
+    )
+    assert job.notification_state == "pending"
+
+    barrier = threading.Barrier(5)
+    winners: list[JobCompletion | None] = []
+
+    def compete() -> None:
+        barrier.wait()
+        winners.append(jobs.consume_notification(seen[0]))
+
+    threads = [threading.Thread(target=compete) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert sum(item is not None for item in winners) == 1
+    assert jobs.consume_notification(seen[0]) is None
+    # 消费通知不会删除任务结果，之后仍可显式读取。
+    assert "task-result" in jobs.task_manage("output", job.job_id)
+
+
+@pytest.mark.parametrize("action", ["output", "wait", "cancel"])
+def test_terminal_task_controls_consume_notice(action: str, tmp_path: Path) -> None:
+    jobs = TaskRegistry()
+    seen: list[JobCompletion] = []
+    jobs.on_complete(seen.append)
+    job = jobs.add_task(lambda _job: "done", command="demo", cwd=tmp_path)
+    assert job.done.wait(timeout=2)
+    assert len(seen) == 1
+    report = jobs.task_manage(action, job.job_id, timeout=2)
+    assert "done" in report
+    assert job.notification_state == "consumed"
+    assert jobs.consume_notification(seen[0]) is None
+
+
+def test_task_wait_timeout_does_not_cancel(tmp_path: Path) -> None:
+    jobs = TaskRegistry()
+    release = threading.Event()
+    job = jobs.add_task(
+        lambda _job: release.wait(timeout=5) and "finished",
+        command="slow",
+        cwd=tmp_path,
+    )
+    try:
+        report = jobs.task_manage("wait", job.job_id, timeout=1)
+        assert "任务未被取消" in report
+        assert job.running()
+    finally:
+        release.set()
+    assert job.done.wait(timeout=2)
+    assert "finished" in jobs.task_manage("output", job.job_id)
+
+
+def test_subagent_admission_is_per_owner_and_released(tmp_path: Path) -> None:
+    jobs = TaskRegistry()
+    release = threading.Event()
+
+    def runner(_job) -> str:
+        release.wait(timeout=5)
+        return "ok"
+
+    first = jobs.add_task(
+        runner, command="a1", cwd=tmp_path,
+        owner_session_id="a", max_active=1,
+    )
+    with pytest.raises(TaskLimitError):
+        jobs.add_task(
+            runner, command="a2", cwd=tmp_path,
+            owner_session_id="a", max_active=1,
+        )
+    other = jobs.add_task(
+        runner, command="b1", cwd=tmp_path,
+        owner_session_id="b", max_active=1,
+    )
+    release.set()
+    assert first.done.wait(timeout=2)
+    assert other.done.wait(timeout=2)
+    # 终态释放名额，同 owner 可以再次启动。
+    third = jobs.add_task(
+        lambda _job: "new", command="a3", cwd=tmp_path,
+        owner_session_id="a", max_active=1,
+    )
+    assert third.done.wait(timeout=2)
+
+
+def test_cancel_running_task_consumes_queued_notice(tmp_path: Path) -> None:
+    jobs = TaskRegistry()
+    seen: list[JobCompletion] = []
+    jobs.on_complete(seen.append)
+    started = threading.Event()
+
+    def runner(job) -> str:
+        started.set()
+        job.cancel_event.wait(timeout=5)
+        return "stopped"
+
+    job = jobs.add_task(runner, command="cancel-me", cwd=tmp_path, delivery="wake")
+    assert started.wait(timeout=2)
+    report = jobs.task_manage("cancel", job.job_id)
+    assert "cancelled" in report
+    assert not job.running()
+    deadline = time.monotonic() + 2
+    while not seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert seen
+    assert jobs.consume_notification(seen[0]) is None
+
+
+def test_idle_subagent_completion_wakes_agent_once(tmp_path: Path) -> None:
+    jobs = TaskRegistry()
+    seen: list[JobCompletion] = []
+    jobs.on_complete(seen.append)
+    agent = _FakeAgent()
+    agent._release.set()
+    session = InteractiveSession(
+        agent, store=None, session_id="s", registry=None,
+        printer=_FakePrinter(), color=False, jobs=jobs,
+    )
+    job = jobs.add_task(
+        lambda _job: "idle-result", command="idle", cwd=tmp_path,
+        kind="subagent", delivery="wake",
+    )
+    assert job.done.wait(timeout=2)
+    assert len(seen) == 1
+    session._handle_completion(seen[0])
+    session._handle_completion(seen[0])  # 重复队列事件必须 no-op
+    assert len(agent.calls) == 1
+    assert "idle-result" in agent.calls[0]
+    assert agent.events == []

@@ -130,6 +130,7 @@ class ToolContext:
     def __init__(self, workdir: Path):
         self.workdir = workdir.resolve()
         self.event_hook: Callable[[str, dict], None] | None = None
+        self.session_id: str | None = None
 
 
 class Tool(ABC):

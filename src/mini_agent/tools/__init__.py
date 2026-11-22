@@ -23,7 +23,7 @@ from .ls import LsTool
 from .read import ReadTool
 from .rm_mv import MVTool, RMTool
 from .shell import ShellTools
-from .subagent import SubagentTool
+from .subagent import SubagentTool, TaskManageTool
 from .write import WriteTool
 
 __all__ = [
@@ -31,7 +31,7 @@ __all__ = [
     "ValidationResult", "decode_output", "semantic_bool", "semantic_int",
     "FileState", "FileStateCache", "FileToolContext",
     "ReadTool", "EditTool", "WriteTool", "RMTool", "MVTool", "GlobTool", "GrepTool", "LsTool",
-    "ShellTools", "SubagentTool",
+    "ShellTools", "SubagentTool", "TaskManageTool",
     "build_tools",
 ]
 
@@ -54,9 +54,10 @@ def build_tools(cfg, spill_dir: Path | None = None) -> ToolRegistry:
     from ..jobs import JobRegistry
     jobs = JobRegistry()
     registry.jobs = jobs
+    registry.register(TaskManageTool(jobs))
     if cfg.enable_shell:
         for tool in ShellTools(cfg.workdir, shell=cfg.shell, jobs=jobs).tools():
             registry.register(tool)
     if cfg.enable_subagent:
-        registry.register(SubagentTool())
+        registry.register(SubagentTool(jobs=jobs))
     return registry

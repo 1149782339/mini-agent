@@ -26,7 +26,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .base import Tool, ToolContext, ToolError, ToolOutput, ValidationResult, semantic_int
+from .base import (
+    Tool,
+    ToolContext,
+    ToolError,
+    ToolOutput,
+    ValidationResult,
+    semantic_bool,
+    semantic_int,
+)
 from ..envutil import sanitize_subprocess_env
 from .shell import WindowsJob, kill_process_tree
 
@@ -254,7 +262,9 @@ class SubagentTool(Tool):
         "一次响应里发多个 Task 调用，它们会并行执行。\n"
         "- 不适合：一两步就能做完的事（直接自己做更快）。\n"
         "- 任务要自包含：子代理无法向你追问；步数预算约 150 步，过大的调研请"
-        "按子系统/目录拆开派发。"
+        "按子系统/目录拆开派发。\n"
+        "- run_in_background=true 时立即返回 task_id，结果完成后自动送回；可用"
+        "task_manage 查询、等待或取消。默认 false，行为与原来一致。"
     )
     parameters = {
         "type": "object",
@@ -267,10 +277,21 @@ class SubagentTool(Tool):
                 "type": "integer",
                 "description": f"最长运行秒数，默认 {DEFAULT_TIMEOUT}，最大 3600",
             },
+            "run_in_background": {
+                "type": "boolean",
+                "description": "是否后台执行；默认 false。仅交互模式可用，不静默降级",
+            },
         },
         "required": ["prompt"],
         "additionalProperties": False,
     }
+
+    def __init__(self, jobs=None, max_active_per_owner: int = 4) -> None:
+        if jobs is None:
+            from ..jobs import TaskRegistry
+            jobs = TaskRegistry()
+        self.jobs = jobs
+        self.max_active_per_owner = max_active_per_owner
 
     def is_concurrency_safe(self) -> bool:
         return True  # 子代理是独立进程天然隔离；并行派发是它的核心用法
@@ -282,18 +303,69 @@ class SubagentTool(Tool):
         return ValidationResult.pass_()
 
     def call(self, args: dict[str, Any], ctx: ToolContext) -> ToolOutput:
+        from ..jobs import TaskLimitError
+
         task = args["prompt"].strip()
         timeout = semantic_int(args.get("timeout"), DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT
         timeout = max(60, min(int(timeout), 3600))
-        tag = f"子代理#{next(_TAG_COUNTER)}"
-        hook = getattr(ctx, "event_hook", None)  # 可能为 None（测试/无注入场景）
+        background = semantic_bool(args.get("run_in_background"), False)
+        if background and (
+            not self.jobs.allow_background_subagents or not self.jobs.allow_notify
+        ):
+            raise ToolError(
+                "后台 Subagent 在 -p/print 或关闭通知的模式下不可用；"
+                "请省略 run_in_background，使用同步 Task",
+                24,
+            )
 
+        tag = f"子代理#{next(_TAG_COUNTER)}"
+        hook = getattr(ctx, "event_hook", None)
+        owner = getattr(ctx, "session_id", None)
+        try:
+            job = self.jobs.add_task(
+                lambda task_job: self._execute(task, timeout, ctx, tag, hook, task_job),
+                command=task,
+                cwd=ctx.workdir,
+                kind="subagent",
+                owner_session_id=owner,
+                delivery="wake" if background else "none",
+                max_active=self.max_active_per_owner,
+            )
+        except TaskLimitError as exc:
+            raise ToolError(str(exc), 25) from None
+
+        if background:
+            return ToolOutput(
+                f"[已启动后台子代理 {job.job_id}]\n"
+                f"task_id={job.job_id}\n"
+                "任务完成后会自动送回结果；无需反复查询。可用 task_manage 的 "
+                "list/get/output/wait/cancel 控制，wait 超时不会取消任务。",
+                {"type": "subagent", "task_id": job.job_id, "background": True},
+            )
+
+        try:
+            finished = job.done.wait(timeout=timeout + 5)
+        except KeyboardInterrupt:
+            self.jobs.task_manage("cancel", job.job_id)
+            raise
+        if not finished:
+            self.jobs.task_manage("cancel", job.job_id)
+            raise ToolError(f"子代理任务 {job.job_id} 未在截止时间后退出", 21)
+        if job.error:
+            raise ToolError(job.error, job.error_code)
+        meta = dict(job.meta)
+        meta["task_id"] = job.job_id
+        return ToolOutput(job.result or "(子代理未返回文本结果)", meta)
+
+    def _execute(self, task: str, timeout: int, ctx: ToolContext, tag: str, hook, job) -> ToolOutput:
+        """同步与后台共用的子进程执行器；只返回结果，不碰父会话。"""
         def _report(step: int, tokens: int, snippet: str, status: str,
                     exit_code: int | None = None) -> None:
             if hook is not None:
                 hook("subagent_progress", {
                     "tag": tag, "step": step, "tokens": tokens,
                     "snippet": snippet, "status": status, "exit": exit_code,
+                    "task_id": job.job_id,
                 })
 
         debug = os.environ.get("MINI_AGENT_DEBUG", "").strip() in {"1", "true"}
@@ -305,6 +377,9 @@ class SubagentTool(Tool):
                     f"[subagent-debug] {tag} {marker} @{time.time():.3f} "
                     f"(+{time.monotonic() - _t0:.2f}s)\n"
                 )
+
+        if job.cancel_event.is_set():
+            raise ToolError(f"子代理任务 {job.job_id} 已取消", 26)
 
         # system prompt 走临时文件，经 --append-system-prompt 传给子进程
         tmp = tempfile.NamedTemporaryFile(
@@ -324,11 +399,10 @@ class SubagentTool(Tool):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,            # 流式逐行读需要文本模式
+                text=True,
                 bufsize=1,
                 encoding="utf-8",
                 errors="replace",
-                # 独立进程组：POSIX 上 killpg 不会误伤父代理
                 start_new_session=True,
             )
             if sys.platform == "win32":
@@ -337,15 +411,18 @@ class SubagentTool(Tool):
                 proc = subprocess.Popen(argv, **popen_kwargs)
             except OSError as exc:
                 raise ToolError(f"无法启动子代理进程：{exc}", 20) from None
+            job.proc = proc
             _dbg("popen-done")
 
-            job = WindowsJob() if WindowsJob is not None else None
-            if job is not None:
-                job.attach(proc)
-            _ACTIVE_PROCS[id(proc)] = (proc, job)
+            win_job = WindowsJob() if WindowsJob is not None else None
+            if win_job is not None:
+                win_job.attach(proc)
+            job.win_job = win_job
+            _ACTIVE_PROCS[id(proc)] = (proc, win_job)
+            if job.cancel_event.is_set():
+                _kill_proc(proc, win_job)
             _dbg("pre-drain")
-            # stderr 并发排空：PIPE 容量有限（Windows 64KB），子进程 stderr
-            # 写满了没进程读会整体冻死。边跑边抽干，结束时汇总
+            # stderr 并发排空，避免 PIPE 写满后冻死子进程。
             stderr_chunks: list[str] = []
             if proc.stderr is not None:
                 def _drain(stream=proc.stderr, sink=stderr_chunks):
@@ -353,8 +430,7 @@ class SubagentTool(Tool):
                         sink.append(chunk)
                 threading.Thread(target=_drain, daemon=True).start()
 
-            _report(0, 0, "子进程已启动", "running")  # 面板立刻出现，不等首个响应
-
+            _report(0, 0, "子进程已启动", "running")
             step = 0
             tokens = 0
 
@@ -375,10 +451,8 @@ class SubagentTool(Tool):
                     _report(step, tokens, snippet, "running")
 
             try:
-                # 读 stdout 有截止时间：子进程不退出也会被杀掉，
-                # 而不是等它自己关闭管道之后才发现已经超时。
                 try:
-                    lines = collect_stdout(proc, timeout, _on_line, job)
+                    lines = collect_stdout(proc, timeout, _on_line, win_job)
                 except ProcessTimeout:
                     raise ToolError(
                         f"子代理运行超过 {timeout}s 被杀。任务太大请拆小后重试。", 21
@@ -386,13 +460,16 @@ class SubagentTool(Tool):
                 _report(step, tokens, "", "done", proc.returncode)
             finally:
                 _ACTIVE_PROCS.pop(id(proc), None)
-                if job is not None:
-                    job.close()
+                if win_job is not None:
+                    win_job.close()
+                    job.win_job = None
             err = "".join(stderr_chunks)
+            job.append("stderr", err)
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
         out = "".join(lines)
+        job.append("stdout", out)
         parsed = parse_json_events(out)
 
         if parsed["error"] and not parsed["final"]:
@@ -407,7 +484,6 @@ class SubagentTool(Tool):
         final = truncate_result(parsed["final"] or "(子代理未返回文本结果)")
         truncated_steps = _STEP_LIMIT_NOTICE in final
         if truncated_steps:
-            # 结果不完整要显式告诉父代理（它据此缩小范围重派，而不是当作完整结论）
             final += (
                 f"\n\n[注意] 子代理被步数上限（{CHILD_MAX_STEPS} 步）截断，以上不完整；"
                 "请把任务拆小或缩小范围后重新派发。"
@@ -416,3 +492,38 @@ class SubagentTool(Tool):
                 "stop": parsed["last_stop"], "exit": proc.returncode,
                 "truncated": truncated_steps}
         return ToolOutput(final, meta)
+
+
+class TaskManageTool(Tool):
+    name = "task_manage"
+    description = (
+        "控制统一后台任务（Shell/Subagent）。action=list 查看；get 读取状态但不消费"
+        "完成通知；output 获取输出；wait 等待（超时不会取消）；cancel 取消。"
+        "终态 output/wait/cancel 会消费对应自动通知，避免结果重复送回。"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "get", "output", "wait", "cancel"],
+            },
+            "task_id": {"type": "string", "description": "Task 启动时返回的 task_id"},
+            "timeout": {"type": "integer", "description": "wait 秒数，默认 30，最大 3600"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+
+    def __init__(self, jobs) -> None:
+        self.jobs = jobs
+
+    def call(self, args: dict[str, Any], ctx: ToolContext) -> ToolOutput:
+        timeout = semantic_int(args.get("timeout"), None)
+        text = self.jobs.task_manage(
+            args["action"],
+            task_id=args.get("task_id"),
+            timeout=timeout,
+            owner_session_id=getattr(ctx, "session_id", None),
+        )
+        return ToolOutput(text)
