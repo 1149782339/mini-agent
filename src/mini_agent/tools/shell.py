@@ -349,10 +349,12 @@ class ShellTools:
         env: dict[str, str] | None = None,
         shell: str = "auto",
         jobs=None,
+        foreground_block_budget: float = 15.0,
     ):
         self.workdir = workdir.resolve()
         self.default_timeout = default_timeout
         self.hard_timeout = hard_timeout
+        self.foreground_block_budget = max(0.0, float(foreground_block_budget))
         # 延迟导入，避免与 jobs 循环引用
         if jobs is None:
             from ..jobs import TaskRegistry
@@ -423,6 +425,7 @@ class ShellTools:
         self,
         command: str,
         timeout: int | None = None,
+        block_until: float | None = None,
         cwd: str | None = None,
         background: bool | str = False,
         notify_on_complete: bool | str = False,
@@ -437,6 +440,13 @@ class ShellTools:
         command = rewrite_windows_null_redirect(command)
         background = semantic_bool(background, False)
         notify_requested = semantic_bool(notify_on_complete, False)
+        if block_until is None:
+            block_budget = self.foreground_block_budget
+        else:
+            try:
+                block_budget = max(0.0, float(block_until))
+            except (TypeError, ValueError):
+                return "ERROR: block_until 必须是数字（秒）"
 
         try:
             workdir = self._resolve_cwd(cwd)
@@ -446,23 +456,35 @@ class ShellTools:
             return f"ERROR: cwd 不存在 {workdir}"
 
         proc, job_obj = self._spawn(command, workdir)
+
+        def _kill_tree() -> None:
+            if job_obj is not None and getattr(job_obj, "active", False):
+                job_obj.kill()
+            else:
+                kill_process_tree(proc)
+
         task = self.jobs.add_running(
             proc,
             command=command,
             cwd=workdir,
             win_job=job_obj,
             notify_on_complete=notify_requested if background else False,
+            kill_fn=_kill_tree,
         )
         if background:
             return self.jobs.format_started(task, notify_requested=notify_requested)
 
-        # 前台：仍受 timeout / hard_timeout 约束，但超时后交互模式升级为后台。
+        # 前台：阻塞预算只决定何时交还控制权；timeout 才是最终终止时限。
+        # 非交互模式没人消费通知，保持旧行为：等满 timeout 后直接杀。
         limit = int(timeout) if timeout else self.default_timeout
         limit = max(1, min(limit, self.hard_timeout))
+        block = min(block_budget, float(limit)) if self.jobs.allow_notify else float(limit)
         register_shell(proc, job_obj)
         started = time.monotonic()
         try:
-            finished = task.done.wait(timeout=limit)
+            finished = False if block <= 0 else task.done.wait(timeout=block)
+            if task.done.is_set():  # 竞态：刚好在等待结束时完成
+                finished = True
         except KeyboardInterrupt:
             if job_obj is not None and getattr(job_obj, "active", False):
                 job_obj.kill()
@@ -489,10 +511,13 @@ class ShellTools:
                 task.win_job = None
             return "\n".join(parts)
 
-        # 超时
+        # 阻塞预算用完，任务还没结束
         if self.jobs.allow_notify:
             task.notify_on_complete = True
             task.upgraded_from_timeout = True
+            # 只有 timeout 比阻塞预算长时才需要 watchdog；否则保持旧语义，不额外杀。
+            if block_budget < float(limit):
+                task.deadline = started + limit
             self.jobs.persist(task)
             return self.jobs.format_started(task, notify_requested=True, upgraded=True)
 
@@ -558,9 +583,10 @@ class ShellTools:
                     "Linux/macOS 上是 sh。继承 PATH/HOME 等运行环境，但不传递 API key 等密钥。"
                     "用于跑测试、编译、安装依赖、查看进程。非交互式，stdin 已关闭，"
                     "不要用它跑 vim/top 之类交互程序。"
-                    "长时间任务（下载、编译）请设 background=true，立刻返回 task_id，不要同步死等；"
+                    "长时间任务（下载、编译）在前台最多阻塞 15 秒就会自动转后台，"
+                    "返回 task_id，不会杀进程；不要把转后台当成失败，也不要重复执行。"
                     "需要做完后自动继续时再加 notify_on_complete=true。"
-                    "前台命令触达超时时，交互模式下会升级为后台并打开完成通知，而不是杀掉。"
+                    "前台命令到 timeout 仍未结束时，交互模式下也会转后台，而不是杀掉。"
                     "不要在这里直接执行 rm 或 mv（包括 /bin/rm、/usr/bin/mv），请改用 RM 或 MV 工具；"
                     "路径必须是工作目录内的字面绝对路径。这是安全带，不拦 python / find -delete / git rm 等绕法。"
                 ),
@@ -573,8 +599,15 @@ class ShellTools:
                         },
                         "timeout": {
                             "type": "integer",
-                            "description": "前台超时秒数，默认 60，最大 300。后台任务不受此硬杀限制。",
+                            "description": "命令总运行秒数，默认 60，最大 300；到点仍在跑就终止进程树。",
                             "default": DEFAULT_TIMEOUT,
+                        },
+                        "block_until": {
+                            "type": "number",
+                            "description": (
+                                "前台最多阻塞秒数，默认 15；0 表示立即转后台继续运行。"
+                                "只影响何时交还控制权，不杀进程。"
+                            ),
                         },
                         "cwd": {
                             "type": "string",

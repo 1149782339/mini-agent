@@ -35,6 +35,7 @@ from .base import (
     semantic_bool,
     semantic_int,
 )
+from ..config import Config
 from ..envutil import sanitize_subprocess_env
 from ..prompts import load_prompt
 from .shell import WindowsJob, kill_process_tree
@@ -157,15 +158,22 @@ def build_child_argv(task: str, prompt_file: str, model: str = "",
 def build_child_env(
     base: dict[str, str] | None = None,
     max_steps: int = CHILD_MAX_STEPS,
+    config: Config | None = None,
 ) -> dict[str, str]:
     """构造子代理进程的环境。
 
-    剥离父进程里的 API key 等密钥。子进程启动时由 load_config() 自行从
-    当前目录上层的 .env 读取密钥，不靠继承父进程环境。
-    MINI_AGENT_MAX_STEPS 仍由父进程显式写入，覆盖子代理步数预算。
+    先剥离父进程里的 API key 等密钥，再把父进程**实际生效**的模型配置
+    显式写回：子进程是另一个 mini-agent，密钥只从 .env 读会在纯环境变量
+    启动（无 .env）时直接失败。写回的密钥只存在于子代理进程；
+    它自己再派生命令/孙代理时会重新 sanitize，不会外泄。
     """
     env = sanitize_subprocess_env(base)
     env["MINI_AGENT_MAX_STEPS"] = str(max_steps)
+    if config is not None:
+        env["MINI_AGENT_API_KEY"] = config.api_key
+        env["MINI_AGENT_BASE_URL"] = config.base_url
+        env["MINI_AGENT_MODEL"] = config.model
+        env["MINI_AGENT_CONTEXT_WINDOW"] = str(config.context_window)
     return env
 
 
@@ -275,12 +283,15 @@ class SubagentTool(Tool):
         "additionalProperties": False,
     }
 
-    def __init__(self, jobs=None, max_active_per_owner: int = 4) -> None:
+    def __init__(
+        self, jobs=None, max_active_per_owner: int = 4, config: Config | None = None
+    ) -> None:
         if jobs is None:
             from ..jobs import TaskRegistry
             jobs = TaskRegistry()
         self.jobs = jobs
         self.max_active_per_owner = max_active_per_owner
+        self.config = config
 
     def is_concurrency_safe(self) -> bool:
         return True  # 子代理是独立进程天然隔离；并行派发是它的核心用法
@@ -378,9 +389,9 @@ class SubagentTool(Tool):
             tmp.write(CHILD_SYSTEM_PROMPT)
             tmp.close()
             argv = build_child_argv(prompt, tmp.name)
-            # 子进程是独立 load_config()：步数预算经环境变量给它（深调研默认 150 步）。
-            # 密钥不从父进程环境继承，由子进程自己读当前目录上层的 .env。
-            child_env = build_child_env(os.environ, CHILD_MAX_STEPS)
+            # 子进程是独立 load_config()：密钥与模型配置由父进程显式写入，
+            # 否则纯环境变量启动（没有 .env）时子代理会拿不到 key。
+            child_env = build_child_env(os.environ, CHILD_MAX_STEPS, config=self.config)
             _dbg("tmpfile-ready")
             popen_kwargs: dict[str, Any] = dict(
                 cwd=str(ctx.workdir),
@@ -413,11 +424,13 @@ class SubagentTool(Tool):
             _dbg("pre-drain")
             # stderr 并发排空，避免 PIPE 写满后冻死子进程。
             stderr_chunks: list[str] = []
+            drain: threading.Thread | None = None
             if proc.stderr is not None:
                 def _drain(stream=proc.stderr, sink=stderr_chunks):
                     for chunk in iter(stream.readline, ""):
                         sink.append(chunk)
-                threading.Thread(target=_drain, daemon=True).start()
+                drain = threading.Thread(target=_drain, daemon=True)
+                drain.start()
 
             _report(0, 0, "子进程已启动", "running")
             step = 0
@@ -452,6 +465,8 @@ class SubagentTool(Tool):
                 if win_job is not None:
                     win_job.close()
                     task.win_job = None
+            if drain is not None:
+                drain.join(timeout=2)
             err = "".join(stderr_chunks)
             task.append("stderr", err)
         finally:

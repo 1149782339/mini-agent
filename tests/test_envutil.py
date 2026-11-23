@@ -103,3 +103,19 @@ def test_task_child_env_scrubs_keys_keeps_max_steps() -> None:
     assert "PATH" in env
     for key in ("MINI_AGENT_API_KEY", "ARK_API_KEY", "OPENAI_API_KEY"):
         assert key not in env
+
+
+def test_task_child_env_injects_effective_config() -> None:
+    from mini_agent.config import Config
+
+    cfg = Config(
+        api_key="effective-key",
+        base_url="https://example.test/v3",
+        model="test-model",
+        context_window=123456,
+    )
+    env = build_child_env({"PATH": "/usr/bin"}, config=cfg)
+    assert env["MINI_AGENT_API_KEY"] == "effective-key"
+    assert env["MINI_AGENT_BASE_URL"] == "https://example.test/v3"
+    assert env["MINI_AGENT_MODEL"] == "test-model"
+    assert env["MINI_AGENT_CONTEXT_WINDOW"] == "123456"

@@ -13,7 +13,7 @@ def test_prompt_files_exist() -> None:
 
 def test_system_prompt_content() -> None:
     assert SYSTEM_PROMPT.startswith("【PERSONA_LOAD】")
-    assert "不要同步死等" in SYSTEM_PROMPT
+    assert "自动转后台" in SYSTEM_PROMPT
     assert "{" not in SYSTEM_PROMPT
     assert SYSTEM_PROMPT.endswith("\n")
 

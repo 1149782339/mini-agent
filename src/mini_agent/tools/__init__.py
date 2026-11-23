@@ -61,8 +61,13 @@ def build_tools(
     registry.jobs = jobs
     registry.register(TaskManageTool(jobs))
     if cfg.enable_shell:
-        for tool in ShellTools(cfg.workdir, shell=cfg.shell, jobs=jobs).tools():
+        for tool in ShellTools(
+            cfg.workdir,
+            shell=cfg.shell,
+            jobs=jobs,
+            foreground_block_budget=cfg.foreground_block_budget,
+        ).tools():
             registry.register(tool)
     if cfg.enable_subagent:
-        registry.register(SubagentTool(jobs=jobs))
+        registry.register(SubagentTool(jobs=jobs, config=cfg))
     return registry

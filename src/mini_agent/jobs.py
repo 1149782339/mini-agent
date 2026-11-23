@@ -88,6 +88,9 @@ class Task:
     error: str = ""
     error_code: int | None = None
     lost: bool = False
+    timed_out: bool = False
+    deadline: float | None = None  # 前台转后台后仍要遵守的总运行时限
+    kill_fn: Callable[[], None] | None = None
     meta: dict = field(default_factory=dict)
     stdout_parts: list[str] = field(default_factory=list)
     stderr_parts: list[str] = field(default_factory=list)
@@ -126,10 +129,12 @@ class Task:
 
     @property
     def status(self) -> str:
-        if self.running():
+        if self.finished_at is None and self.running():
             return "running"
         if self.lost:
             return "lost"
+        if self.timed_out:
+            return "timeout"
         if self.cancel_event.is_set():
             return "cancelled"
         if self.error:
@@ -208,6 +213,7 @@ class TaskRegistry:
                 error=str(data.get("error") or ""),
                 error_code=data.get("error_code"),
                 lost=bool(data.get("lost")),
+                timed_out=bool(data.get("timed_out")),
                 meta=dict(data.get("meta") or {}),
                 stdout_parts=[str(data.get("stdout") or "")],
                 stderr_parts=[str(data.get("stderr") or "")],
@@ -259,6 +265,7 @@ class TaskRegistry:
             "error": task.error,
             "error_code": task.error_code,
             "lost": task.lost,
+            "timed_out": task.timed_out,
             "meta": task.meta,
             "stdout": out,
             "stderr": err,
@@ -298,12 +305,14 @@ class TaskRegistry:
         win_job: object | None = None,
         notify_on_complete: bool = False,
         upgraded_from_timeout: bool = False,
+        kill_fn: Callable[[], None] | None = None,
         initial_stdout: bytes | str | None = None,
         initial_stderr: bytes | str | None = None,
     ) -> Task:
         """登记一个已经启动、仍在跑的 Shell 进程，并开始收集输出。"""
         with self._lock:
             task_id = self._next_id()
+            notify = bool(notify_on_complete) and self.allow_notify
             task = Task(
                 task_id=task_id,
                 command=command,
@@ -311,10 +320,12 @@ class TaskRegistry:
                 proc=proc,
                 win_job=win_job,
                 started=time.monotonic(),
-                notify_on_complete=bool(notify_on_complete) and self.allow_notify,
+                notify_on_complete=notify,
                 upgraded_from_timeout=upgraded_from_timeout,
+                kill_fn=kill_fn,
                 kind="shell",
-                delivery="record",
+                # 开了通知就唤醒 Agent 继续处理；否则只记录，等用户下次说话。
+                delivery="wake" if notify else "record",
                 notice_id=f"{task_id}:complete",
             )
             self._tasks[task_id] = task
@@ -422,8 +433,23 @@ class TaskRegistry:
             ))
         for t in pumps:
             t.start()
+        # 轮询而不是无限 wait：前台转后台后 deadline 才被设置，需要能中途生效。
         try:
-            proc.wait()
+            while True:
+                if task.deadline is not None and time.monotonic() >= task.deadline:
+                    task.timed_out = True
+                    if task.kill_fn is not None:
+                        task.kill_fn()
+                    else:
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=KILL_WAIT)
+                    except Exception:
+                        pass
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.2)
         except Exception:
             pass
         for t in pumps:
@@ -478,9 +504,11 @@ class TaskRegistry:
         self.consume_notification(task.task_id)
 
     def _pump(self, task: Task, pipe, kind: str) -> None:
+        # read1：有多少拿多少，别等缓冲区攒满——否则转后台那一刻拿不到已有输出。
+        read = getattr(pipe, "read1", None) or pipe.read
         try:
             while True:
-                chunk = pipe.read(4096)
+                chunk = read(4096)
                 if not chunk:
                     break
                 task.append(kind, decode_output(chunk))
@@ -549,7 +577,17 @@ class TaskRegistry:
     def format_started(self, task: Task, *, notify_requested: bool, upgraded: bool = False) -> str:
         notify = task.notify_on_complete
         if upgraded:
-            head = f"[TIMEOUT，已升级为后台任务 {task.task_id}，进程仍在运行，没有被杀掉]"
+            if task.deadline is None:
+                head = (
+                    f"[前台阻塞预算已用完，已升级为后台任务 {task.task_id}，"
+                    "进程仍在运行，没有被杀掉]"
+                )
+            else:
+                remaining = max(0.0, task.deadline - time.monotonic())
+                head = (
+                    f"[前台阻塞预算已用完，已升级为后台任务 {task.task_id}，"
+                    f"进程仍在运行；最长再跑 {remaining:.0f}s 后终止]"
+                )
         else:
             head = f"[已在后台启动 {task.task_id}]"
         notes = [
@@ -558,7 +596,10 @@ class TaskRegistry:
             f"cwd={task.cwd}  pid={getattr(task.proc, 'pid', '?')}",
         ]
         if notify:
-            notes.append("已打开完成通知：任务结束后会把退出码和输出汇报给你，然后停下，不会自动开始下一步。请不要反复 poll。")
+            notes.append(
+                "已打开完成通知：任务结束后会唤醒 Agent，把退出码和输出送回来继续处理。"
+                "不要重复执行同一命令，也不要反复 poll。"
+            )
         elif notify_requested and not self.allow_notify:
             notes.append(
                 "当前是非交互模式，完成通知已关闭（退出后没有人接手）。"
@@ -783,7 +824,10 @@ def format_task_report(
     if headline:
         parts.append(headline)
     if task.kind == "shell":
-        status = "running" if task.running() else ("lost" if task.lost else f"exit={task.exit_code}")
+        # 通知早于 done.set() 入队，不能用 running() 判断，否则会显示成 running。
+        status = "running" if task.finished_at is None else (
+            "lost" if task.lost else ("timeout" if task.timed_out else f"exit={task.exit_code}")
+        )
         parts.append(
             f"task_id={task.task_id}  {status}  time={task.elapsed():.2f}s  "
             f"cwd={task.cwd}  notify={'on' if task.notify_on_complete else 'off'}"
@@ -803,7 +847,7 @@ def format_task_report(
 
     parts.append(
         f"task_id={task.task_id}  kind={task.kind}  status={task.status}  "
-        f"time={task.elapsed():.2f}s  cwd={task.cwd}  notice={task.notification_state}"
+        f"time={task.elapsed():.2f}s  cwd={task.cwd}"
     )
     parts.append(f"command={task.command}")
     if extra:

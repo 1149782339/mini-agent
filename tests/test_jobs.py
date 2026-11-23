@@ -44,6 +44,8 @@ def test_notify_fires_on_complete(tmp_path: Path) -> None:
         assert seen, "完成通知没有触发"
         assert seen[0].exit_code == 0
         assert "hello-bg" in seen[0].message
+        assert "exit=0" in seen[0].message
+        assert "running" not in seen[0].message
         assert seen[0].task_id == "task_01"
     finally:
         jobs.cleanup_all()
@@ -110,6 +112,67 @@ def test_timeout_upgrades_to_background(tmp_path: Path) -> None:
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.1)
         assert marker.exists(), "超时后进程被杀掉了，标记文件没有出现"
+    finally:
+        jobs.cleanup_all()
+
+
+def test_foreground_block_budget_backgrounds_without_killing(tmp_path: Path) -> None:
+    jobs = TaskRegistry(allow_notify=True)
+    shell = ShellTools(
+        tmp_path, default_timeout=30, foreground_block_budget=0.4, jobs=jobs
+    )
+    try:
+        started = time.monotonic()
+        out = shell.run_command("echo early; sleep 5; echo late", timeout=30)
+        elapsed = time.monotonic() - started
+        assert "已升级为后台" in out
+        assert "task_01" in out
+        assert "early" in out  # 转后台时要把已有输出带回来
+        assert elapsed < 3
+        task = jobs.get("task_01")
+        assert task.running()
+        assert task.done.wait(timeout=8), "转后台后进程被杀了"
+        assert task.exit_code == 0
+        assert "late" in task.snapshot()[0]
+    finally:
+        jobs.cleanup_all()
+
+
+def test_block_until_zero_backgrounds_immediately(tmp_path: Path) -> None:
+    jobs = TaskRegistry(allow_notify=True)
+    shell = ShellTools(tmp_path, foreground_block_budget=15, jobs=jobs)
+    try:
+        started = time.monotonic()
+        out = shell.run_command("sleep 2", block_until=0, timeout=10)
+        assert time.monotonic() - started < 1
+        assert "task_01" in out
+        assert jobs.get("task_01").running()
+    finally:
+        jobs.cleanup_all()
+
+
+def test_upgraded_task_killed_at_total_timeout(tmp_path: Path) -> None:
+    work = tmp_path / "deadline"
+    work.mkdir()
+    marker = work / "late.txt"
+    jobs = TaskRegistry(allow_notify=True)
+    shell = ShellTools(
+        work, default_timeout=30, foreground_block_budget=0.3, jobs=jobs
+    )
+    command = (
+        "python3 -c \"import time, pathlib; time.sleep(5); "
+        "pathlib.Path('late.txt').write_text('alive')\""
+    )
+    try:
+        started = time.monotonic()
+        out = shell.run_command(command, timeout=2)
+        assert time.monotonic() - started < 3
+        assert "已升级为后台" in out
+        task = jobs.get("task_01")
+        assert task.done.wait(timeout=6)
+        assert task.timed_out
+        assert task.status == "timeout"
+        assert not marker.exists(), "总时限到点后进程仍在写文件"
     finally:
         jobs.cleanup_all()
 

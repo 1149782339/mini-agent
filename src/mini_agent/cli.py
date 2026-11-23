@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -167,6 +169,8 @@ def run_print_mode(args, cfg, llm=None) -> int:
             print(json.dumps(event, ensure_ascii=False), flush=True)
         elif event.get("type") == "result":
             print(event.get("result") or "", flush=True)
+        elif event.get("type") == "error":
+            print(event.get("message") or "ERROR", file=sys.stderr, flush=True)
 
     def _forward(event: str, payload: dict) -> None:
         # 每步模型响应落库后立即转发 message_end（payload 里无 usage，
@@ -480,7 +484,13 @@ def main() -> None:
         raise SystemExit(run_print_mode(args, cfg))
 
     color = sys.stdout.isatty()
-    store = SessionStore()
+    if args.no_session:
+        # 临时库：进程退出即删，子代理也不会往正式会话库里制造空会话。
+        fd, tmp_db = tempfile.mkstemp(prefix="mini_agent_", suffix=".db")
+        os.close(fd)
+        store = SessionStore(Path(tmp_db))
+    else:
+        store = SessionStore()
 
     if args.list:
         sessions = store.list_sessions()
@@ -489,6 +499,8 @@ def main() -> None:
         for row in sessions:
             print(f"{row['id']}  {row['msg_count']:>4} 条  {row['updated_at']}  {row['title'][:40]}")
         store.close()
+        if args.no_session:
+            Path(store.path).unlink(missing_ok=True)
         return
 
     session_id: str | None = None
@@ -531,7 +543,13 @@ def main() -> None:
     )
 
     print(_c(f"mini-agent · {cfg.model}", "green", color))
-    print(_c(f"会话 ID: {session_id}" + (f"（恢复 {restored} 条消息）" if restored else "（新建）"), "cyan", color))
+    if args.no_session:
+        session_note = "（临时，不写库）"
+    elif restored:
+        session_note = f"（恢复 {restored} 条消息）"
+    else:
+        session_note = "（新建）"
+    print(_c(f"会话 ID: {session_id}{session_note}", "cyan", color))
     print(_c(f"工作目录: {cfg.workdir}", "dim", color))
     print(_c(f"Shell: {resolve_shell_name(cfg.shell)}", "dim", color))
     print(_c(f"窗口: {cfg.context_window} tokens，压缩阈值 {cfg.compact_threshold}", "dim", color))
@@ -547,10 +565,13 @@ def main() -> None:
     finally:
         # 告诉用户怎么恢复本次会话
         printer.panels.stop_all()
-        print()
-        print(_c("Resume this session with:", "dim", color))
-        print(_c(f"mini-agent --resume {session_id}", "cyan", color))
+        if not args.no_session:
+            print()
+            print(_c("Resume this session with:", "dim", color))
+            print(_c(f"mini-agent --resume {session_id}", "cyan", color))
         store.close()
+        if args.no_session:
+            Path(store.path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

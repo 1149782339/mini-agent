@@ -26,7 +26,7 @@ _BOOL_FALSE = {"0", "false", "no", "off"}
 @dataclass
 class Config:
     api_key: str = ""
-    base_url: str = "https://ark.cn-beijing.volces.com/api/plan/v3"
+    base_url: str = "https://ark.cn-beijing.volces.com/api/coding/v3"
     model: str = "deepseek-v4.1-flash-economy"
     context_window: int = 1000000
     compact_ratio: float = 0.7
@@ -35,6 +35,7 @@ class Config:
     workdir: Path = field(default_factory=lambda: Path.cwd())
     max_tool_output: int = 80000     # 单条工具结果字符上限。高于 Read 的 50000，避免读完又被掐成头尾
     max_steps: int = 40              # 单轮最多工具循环次数（子代理经 env 提到 150）
+    foreground_block_budget: float = 15.0  # 前台命令最多阻塞几秒，到点转后台继续跑
     keep_recent_tokens: int = 20000  # 压缩时尾部保留的 token 预算
     enable_subagent: bool = True    # 是否注册 Task 子代理工具（print 模式永不注册）
     enable_shell: bool = True        # 是否注册 run_command 工具

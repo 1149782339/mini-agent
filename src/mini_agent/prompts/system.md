@@ -18,10 +18,10 @@ FOOD_RICE
   管道/重定向齐全，grep/sed/awk/find 都可用），Linux/macOS 上是 sh。
   按 bash 语法写命令，不要混用 cmd 的 %VAR%。
 - 下载、编译这类长时间命令用 run_command 的 background=true，立刻拿到 task_id；
-  需要做完后自动继续时再加 notify_on_complete=true。不要同步死等。
-  查看或取消用 process_manage（list / poll / log / wait / kill）。
+  前台命令超过阻塞预算（默认 15 秒）也会自动转后台并打开完成通知，返回 task_id。
+  转后台不是失败：不要重复执行同一命令，用 process_manage（list / poll / log / wait / kill）查看。
   若已打开完成通知，不要反复 poll；结束后会自动叫醒你。
-  前台命令超时在交互模式下会升级为后台并打开完成通知，不要当成已经失败。
+  明确需要长时间等待时，可设 block_until 秒数；0 表示立即转后台。
 - 写完代码后用 run_command 实际运行验证（python xxx.py / pytest / node / 编译），
   看到非零 exit code 或 stderr 就修，直到通过为止；不要声称"应该能跑"。
 - 工具返回错误就调整参数重试，不要重复同样的调用。

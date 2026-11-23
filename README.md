@@ -196,7 +196,7 @@ provider 返回上下文过长时，主循环强制压缩并重试这一轮恰�
 ```toml
 # ~/.config/mini-agent/config.toml（Windows: %APPDATA%/mini-agent/config.toml）
 model = "deepseek-v4.1-flash-economy"
-base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
 context_window = 1000000
 show_reasoning = true
 ```
@@ -206,12 +206,13 @@ show_reasoning = true
 | `MINI_AGENT_API_KEY` | 空 | 密钥。只从环境变量或 `.env` 读取 |
 | `MINI_AGENT_CONFIG` | `~/.config/mini-agent/config.toml` | 配置文件路径，也可用 `--config` 指定 |
 | `MINI_AGENT_ENV_FILE` | 向上查找 `.env` | 显式指定 `.env` 路径 |
-| `MINI_AGENT_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | OpenAI 兼容端点 |
+| `MINI_AGENT_BASE_URL` | `https://ark.cn-beijing.volces.com/api/coding/v3` | OpenAI 兼容端点 |
 | `MINI_AGENT_MODEL` | `deepseek-v4.1-flash-economy` | 模型名 |
 | `MINI_AGENT_CONTEXT_WINDOW` | `1000000` | 窗口 token |
 | `MINI_AGENT_COMPACT_RATIO` | `0.7` | 压缩触发比例 |
 | `MINI_AGENT_MAX_OUTPUT_TOKENS` | `32768` | 单次输出预算（思维链、正文、工具参数共享）。太小会被 `length` 截断 |
 | `MINI_AGENT_MAX_STEPS` | `40` | 单轮最大工具步数。子代理进程内被设为 150 |
+| `MINI_AGENT_FOREGROUND_BLOCK_BUDGET` | `15` | 前台命令最多阻塞秒数，到点自动转后台继续跑；`timeout` 仍负责最终终止 |
 | `MINI_AGENT_KEEP_RECENT_TOKENS` | `20000` | 压缩时尾部保留的 token |
 | `MINI_AGENT_WORKDIR` | `.` | Edit/Write/RM/MV 与 `run_command` 的 cwd 限制在此目录。Read/Glob/Grep 可读任意路径 |
 | `MINI_AGENT_ENABLE_SHELL` | `1` | `0` / `false` / `no` / `off` 关闭 `run_command` |
