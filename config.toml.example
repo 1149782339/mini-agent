@@ -1,0 +1,26 @@
+# 复制到 ~/.config/mini-agent/config.toml 后填写。
+# MINI_AGENT_* 环境变量可临时覆盖同名字段，命令行 --model 优先于所有配置。
+api_key = ""
+base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
+model = "deepseek-v4.1-flash-economy"
+
+# 上下文窗口（token）。DeepSeek-V4.1-Flash 原生 1M 输入
+context_window = 1000000
+compact_ratio = 0.7
+# 压缩时尾部保留的 token 预算
+keep_recent_tokens = 20000
+# 单次响应输出预算（思维链 + 正文 + 工具参数共享）。
+# 模型普遍长思考 + 一次写大文件，给小了会被 finish_reason=length 截断参数
+max_output_tokens = 32768
+# 是否在终端打印思维链
+show_reasoning = true
+# 工作目录。Edit/Write 与 run_command 的 cwd 限制在此目录内；
+# Read/Glob/Grep 可以读取任意路径。
+workdir = "."
+
+# 可选：
+# max_steps = 40
+# enable_shell = true
+# enable_subagent = true
+# shell = "auto"          # auto / gitbash / cmd
+# vision = "auto"        # auto 按模型名判断；true / false 强制开关

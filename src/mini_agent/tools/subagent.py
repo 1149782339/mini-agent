@@ -163,9 +163,9 @@ def build_child_env(
     """构造子代理进程的环境。
 
     先剥离父进程里的 API key 等密钥，再把父进程**实际生效**的模型配置
-    显式写回：子进程是另一个 mini-agent，密钥只从 .env 读会在纯环境变量
-    启动（无 .env）时直接失败。写回的密钥只存在于子代理进程；
-    它自己再派生命令/孙代理时会重新 sanitize，不会外泄。
+    显式写回，确保子代理继承 TOML 加载后再经 CLI 覆盖的值。
+    写回的密钥只存在于子代理进程；它自己再派生命令/孙代理时会重新
+    sanitize，不会外泄。
     """
     env = sanitize_subprocess_env(base)
     env["MINI_AGENT_MAX_STEPS"] = str(max_steps)
@@ -389,8 +389,8 @@ class SubagentTool(Tool):
             tmp.write(CHILD_SYSTEM_PROMPT)
             tmp.close()
             argv = build_child_argv(prompt, tmp.name)
-            # 子进程是独立 load_config()：密钥与模型配置由父进程显式写入，
-            # 否则纯环境变量启动（没有 .env）时子代理会拿不到 key。
+            # 子进程是独立 load_config()：父进程显式写入实际生效配置，
+            # 确保 CLI 覆盖值和 API key 都能传给子代理。
             child_env = build_child_env(os.environ, CHILD_MAX_STEPS, config=self.config)
             _dbg("tmpfile-ready")
             popen_kwargs: dict[str, Any] = dict(

@@ -1,6 +1,6 @@
 """子进程环境清理：run_command / Task 启动子进程时去掉密钥变量。
 
-mini-agent 进程本身仍从环境变量或 .env 读取 API key。
+mini-agent 进程本身从用户 config.toml 读取 API key，环境变量可覆盖。
 这里只影响派出去的子进程，避免命令或孙进程直接继承密钥。
 """
 from __future__ import annotations

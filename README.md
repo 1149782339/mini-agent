@@ -1,7 +1,7 @@
 # mini-agent
 
 一个能真跑的编码代理：工具调用闭环、上下文自动压缩、SQLite 会话。
-核心代码在 `src/mini_agent/`，约 6000 行。依赖 `openai`、`pillow`、`python-dotenv`、`rich`，
+核心代码在 `src/mini_agent/`，约 6000 行。依赖 `openai`、`pillow`、`rich`，
 需要 Python ≥ 3.13，用 uv 管理（`uv run mini-agent`）。
 
 ## 快速开始
@@ -11,8 +11,9 @@
 ```bash
 uv sync                                   # 首次：建 .venv 并装依赖
 
-# 配置（密钥写 .env；模型等偏好可写 ~/.config/mini-agent/config.toml）
-cp .env.example .env
+# 配置（复制模板到用户目录并填写 api_key）
+mkdir -p ~/.config/mini-agent
+cp config.toml.example ~/.config/mini-agent/config.toml
 
 # 启动 REPL（新建会话，会打印会话 ID）
 uv run mini-agent
@@ -126,7 +127,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 
 ```
 src/mini_agent/
-├── config.py       # 环境变量 / .env / config.toml 加载
+├── config.py       # 用户 config.toml 加载，环境变量覆盖
 ├── tokens.py       # 无依赖 token 估算（ASCII 约 3.5 字符/token，中文 1 字/token）
 ├── client.py       # OpenAI 兼容客户端；流式；usage 锚点；重试
 ├── compaction.py   # 压缩纯函数：切点 / 摘要序列化 / 文件清单 / 模板
@@ -189,25 +190,26 @@ provider 返回上下文过长时，主循环强制压缩并重试这一轮恰�
 
 ## 配置
 
-优先级：命令行参数（`--config` / `--model` / `--max-steps`）> 环境变量 > `.env` > `~/.config/mini-agent/config.toml` > 默认值。
-`.env` 从当前目录逐级向上查找，主要用来放密钥；`config.toml` 放非敏感偏好，不能写 `api_key`。
-`.env` 模板见 `.env.example`。
+默认从 `~/.config/mini-agent/config.toml` 读取，Windows 也使用这个路径。
+完整模板见 `config.toml.example`，复制后填写 `api_key` 即可。
+优先级：命令行参数（`--config` / `--model` / `--max-steps`）> 环境变量 > 用户 `config.toml` > 默认值。
+`.env` 不再参与配置加载。
 
 ```toml
-# ~/.config/mini-agent/config.toml（Windows: %APPDATA%/mini-agent/config.toml）
+# ~/.config/mini-agent/config.toml
+api_key = "你的密钥"
 model = "deepseek-v4.1-flash-economy"
 base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
 context_window = 1000000
 show_reasoning = true
 ```
 
-| 变量 | 默认 | 说明 |
+| 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `MINI_AGENT_API_KEY` | 空 | 密钥。只从环境变量或 `.env` 读取 |
+| `MINI_AGENT_API_KEY` | 空 | 覆盖 TOML 的 `api_key`；通常在 TOML 中配置 |
 | `MINI_AGENT_CONFIG` | `~/.config/mini-agent/config.toml` | 配置文件路径，也可用 `--config` 指定 |
-| `MINI_AGENT_ENV_FILE` | 向上查找 `.env` | 显式指定 `.env` 路径 |
-| `MINI_AGENT_BASE_URL` | `https://ark.cn-beijing.volces.com/api/coding/v3` | OpenAI 兼容端点 |
-| `MINI_AGENT_MODEL` | `deepseek-v4.1-flash-economy` | 模型名 |
+| `MINI_AGENT_BASE_URL` | `https://ark.cn-beijing.volces.com/api/coding/v3` | 覆盖 TOML 的 `base_url`，OpenAI 兼容端点 |
+| `MINI_AGENT_MODEL` | `deepseek-v4.1-flash-economy` | 覆盖 TOML 的 `model`；`--model` 优先级更高 |
 | `MINI_AGENT_CONTEXT_WINDOW` | `1000000` | 窗口 token |
 | `MINI_AGENT_COMPACT_RATIO` | `0.7` | 压缩触发比例 |
 | `MINI_AGENT_MAX_OUTPUT_TOKENS` | `32768` | 单次输出预算（思维链、正文、工具参数共享）。太小会被 `length` 截断 |
@@ -233,7 +235,7 @@ show_reasoning = true
 
 ## 编码：全链路 UTF-8
 
-文件读写、SQLite、`.env`、工具返回值一律 UTF-8。子进程输出按 UTF-8 解码，
+文件读写、SQLite、`config.toml`、工具返回值一律 UTF-8。子进程输出按 UTF-8 解码，
 非法字节换成 `�`，不按系统码页猜。`run_command` 给子进程注入
 `PYTHONUTF8=1` 和 `PYTHONIOENCODING=utf-8`。启动时把 stdout / stderr 切到 UTF-8。
 
@@ -290,8 +292,7 @@ uv run python examples/smoke_test.py      # 工具闭环 + 真实压缩
   拦不住 `python` 删文件、`find -delete`、`unlink`、`git rm` 或把 `rm` 写进脚本；
   用 Write / Edit 写含 `rm` 的清理脚本仍然允许。
 - `run_command` 继承 `PATH`、`HOME` 等运行环境，但不传递 `MINI_AGENT_API_KEY`、`ARK_API_KEY` 以及其他常见密钥变量。
-  Task 子代理同样不继承这些密钥；子进程启动时由 `load_config()` 自行从当前目录向上查找 `.env`。
-  如果密钥只存在于父进程环境、文件里没有，子代理会因缺少 API key 而失败。
+  Task 子代理同样先清理这些变量，再由父进程显式传回实际生效的 API key 和模型配置。
 - 前台超时默认 60 秒，上限 300 秒。交互模式下到点不杀，升级为后台任务并打开完成通知；
   `-p` / 非交互模式仍杀掉整棵进程树。后台任务不受这 300 秒硬杀限制。
   终止时 POSIX 对进程组发 `SIGKILL`，Windows 用 Job Object（Job 创建失败时才用 `taskkill`）。

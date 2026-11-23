@@ -1,20 +1,16 @@
-"""配置加载：CLI > 环境变量 > .env > 用户 config.toml > 默认值。
+"""配置加载：CLI > 环境变量 > 用户 config.toml > 默认值。
 
-- `.env` 从当前目录向上查找，主要用来放密钥；已存在的环境变量优先于它。
-- `config.toml` 默认在 `~/.config/mini-agent/config.toml`（Windows 为
-  `%APPDATA%/mini-agent/config.toml`），存放不敏感的长期偏好。
-- 密钥只从环境变量或 `.env` 读取，config.toml 里出现 `api_key` 直接报错。
+- `config.toml` 默认在 `~/.config/mini-agent/config.toml`，包含 API key、
+  模型和其他长期偏好。
+- 环境变量可覆盖 TOML 中的配置，便于临时运行和 Task 子代理传递生效配置。
 - 配置读取不修改 `os.environ`，各来源合并成一次性的 Config。
 """
 from __future__ import annotations
 
 import os
-import sys
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-
-from dotenv import dotenv_values
 
 from .prompts import load_prompt
 
@@ -57,8 +53,8 @@ class Config:
     def validate(self) -> None:
         if not self.api_key:
             raise SystemExit(
-                "缺少 API key：请设置 MINI_AGENT_API_KEY 环境变量，"
-                f"或写入当前项目的 .env（如 {Path.cwd() / '.env'}）。"
+                f"缺少 API key：请在 {user_config_path()} 中设置 api_key，"
+                "或使用 MINI_AGENT_API_KEY 环境变量覆盖。"
             )
 
 
@@ -80,30 +76,11 @@ def model_accepts_images(model: str) -> bool:
 
 
 def user_config_path() -> Path:
-    """用户配置文件：MINI_AGENT_CONFIG 优先，其次 XDG / APPDATA。"""
+    """用户配置文件：MINI_AGENT_CONFIG 优先，否则统一使用 ~/.config。"""
     override = os.environ.get("MINI_AGENT_CONFIG")
     if override:
         return Path(override).expanduser()
-    if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    return base / APP_DIRNAME / "config.toml"
-
-
-def find_env_file() -> Path | None:
-    """`.env`：MINI_AGENT_ENV_FILE 显式指定，否则从当前目录逐级向上找。"""
-    override = os.environ.get("MINI_AGENT_ENV_FILE")
-    if override:
-        path = Path(override).expanduser()
-        if not path.is_file():
-            raise SystemExit(f"MINI_AGENT_ENV_FILE 指向的文件不存在：{path}")
-        return path
-    for directory in (Path.cwd(), *Path.cwd().parents):
-        candidate = directory / ".env"
-        if candidate.is_file():
-            return candidate
-    return None
+    return Path.home() / ".config" / APP_DIRNAME / "config.toml"
 
 
 def _read_toml(path: Path, *, required: bool) -> dict:
@@ -119,8 +96,6 @@ def _read_toml(path: Path, *, required: bool) -> dict:
     for key, value in data.items():
         if isinstance(value, (dict, list)):
             raise SystemExit(f"配置文件 {path} 的 {key} 必须是单个值，不支持分组或数组")
-    if "api_key" in data:
-        raise SystemExit(f"配置文件不保存 api_key：{path}，请改用环境变量或 .env")
     return data
 
 
@@ -161,13 +136,11 @@ def _coerce(name: str, raw: object, default: object) -> object:
 
 
 def load_config(config_file: str | Path | None = None) -> Config:
-    env_path = find_env_file()
-    dotenv_data = dotenv_values(env_path) if env_path else {}
     explicit_toml = config_file is not None or bool(os.environ.get("MINI_AGENT_CONFIG"))
     toml_path = Path(config_file).expanduser() if config_file else user_config_path()
     toml_data = _read_toml(toml_path, required=explicit_toml)
 
-    allowed = {spec.name for spec in fields(Config)} - {"api_key"}
+    allowed = {spec.name for spec in fields(Config)}
     unknown = sorted(set(toml_data) - allowed)
     if unknown:
         raise SystemExit(f"配置文件 {toml_path} 含未知键：{', '.join(unknown)}")
@@ -175,24 +148,15 @@ def load_config(config_file: str | Path | None = None) -> Config:
     defaults = Config()
     values: dict[str, object] = {}
     for spec in fields(Config):
-        if spec.name == "api_key":
-            continue
         env_name = f"MINI_AGENT_{spec.name.upper()}"
         raw = os.environ.get(env_name)
-        if raw is None or raw == "":
-            raw = dotenv_data.get(env_name)
         if raw is None or raw == "":
             raw = toml_data.get(spec.name)
         if raw is None or raw == "":
             continue
         values[spec.name] = _coerce(spec.name, raw, getattr(defaults, spec.name))
 
-    api_key = (
-        os.environ.get("MINI_AGENT_API_KEY")
-        or dotenv_data.get("MINI_AGENT_API_KEY")
-        or ""
-    ).strip()
-    return Config(api_key=api_key, **values)
+    return Config(**values)
 
 
 SYSTEM_PROMPT = load_prompt("system.md")
