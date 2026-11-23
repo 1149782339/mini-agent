@@ -11,7 +11,7 @@
 ```bash
 uv sync                                   # 首次：建 .venv 并装依赖
 
-# 配置（可选：留空会自动复用 ~/.hermes/.env 里的 ARK_API_KEY）
+# 配置（密钥写 .env；模型等偏好可写 ~/.config/mini-agent/config.toml）
 cp .env.example .env
 
 # 启动 REPL（新建会话，会打印会话 ID）
@@ -91,7 +91,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
   步数、token、一行摘要；长思考期间有「思考中 N 字」心跳。
 - **run_command**：见下方安全边界。Windows 上优先 Git Bash（`bash.exe -lc`，
   找不到则退回 cmd），POSIX 上是 `sh -c`。按 bash 语法写命令。
-  长时间任务可设 `background=true`，立刻返回 `job_id`，不受 300 秒硬杀限制；
+  长时间任务可设 `background=true`，立刻返回 `task_id`，不受 300 秒硬杀限制；
   再加 `notify_on_complete=true` 时，任务结束后把退出码和输出汇报给用户并写入会话，然后停下，不自动开始下一步。
   前台命令触达超时时，交互模式会升级为后台并打开完成通知，而不是杀掉。
 - **process_manage**：管理后台命令，动作是 `list` / `poll` / `log` / `wait` / `kill`。
@@ -126,7 +126,7 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 
 ```
 src/mini_agent/
-├── config.py       # 环境变量 / .env / ARK_API_KEY 回退
+├── config.py       # 环境变量 / .env / config.toml 加载
 ├── tokens.py       # 无依赖 token 估算（ASCII 约 3.5 字符/token，中文 1 字/token）
 ├── client.py       # OpenAI 兼容客户端；流式；usage 锚点；重试
 ├── compaction.py   # 压缩纯函数：切点 / 摘要序列化 / 文件清单 / 模板
@@ -189,12 +189,23 @@ provider 返回上下文过长时，主循环强制压缩并重试这一轮恰�
 
 ## 配置
 
-优先级：环境变量 > 项目 `.env` > `~/.hermes/.env` 里的 `ARK_API_KEY`。
-模板见 `.env.example`。
+优先级：命令行参数（`--config` / `--model` / `--max-steps`）> 环境变量 > `.env` > `~/.config/mini-agent/config.toml` > 默认值。
+`.env` 从当前目录逐级向上查找，主要用来放密钥；`config.toml` 放非敏感偏好，不能写 `api_key`。
+`.env` 模板见 `.env.example`。
+
+```toml
+# ~/.config/mini-agent/config.toml（Windows: %APPDATA%/mini-agent/config.toml）
+model = "deepseek-v4.1-flash-economy"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+context_window = 1000000
+show_reasoning = true
+```
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MINI_AGENT_API_KEY` | 空，回退 `ARK_API_KEY` | 密钥 |
+| `MINI_AGENT_API_KEY` | 空 | 密钥。只从环境变量或 `.env` 读取 |
+| `MINI_AGENT_CONFIG` | `~/.config/mini-agent/config.toml` | 配置文件路径，也可用 `--config` 指定 |
+| `MINI_AGENT_ENV_FILE` | 向上查找 `.env` | 显式指定 `.env` 路径 |
 | `MINI_AGENT_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | OpenAI 兼容端点 |
 | `MINI_AGENT_MODEL` | `deepseek-v4.1-flash-economy` | 模型名 |
 | `MINI_AGENT_CONTEXT_WINDOW` | `1000000` | 窗口 token |
@@ -278,7 +289,7 @@ uv run python examples/smoke_test.py      # 工具闭环 + 真实压缩
   拦不住 `python` 删文件、`find -delete`、`unlink`、`git rm` 或把 `rm` 写进脚本；
   用 Write / Edit 写含 `rm` 的清理脚本仍然允许。
 - `run_command` 继承 `PATH`、`HOME` 等运行环境，但不传递 `MINI_AGENT_API_KEY`、`ARK_API_KEY` 以及其他常见密钥变量。
-  Task 子代理同样不继承这些密钥；子进程启动时由 `load_config()` 自行读取项目 `.env` 或 `~/.hermes/.env`。
+  Task 子代理同样不继承这些密钥；子进程启动时由 `load_config()` 自行从当前目录向上查找 `.env`。
   如果密钥只存在于父进程环境、文件里没有，子代理会因缺少 API key 而失败。
 - 前台超时默认 60 秒，上限 300 秒。交互模式下到点不杀，升级为后台任务并打开完成通知；
   `-p` / 非交互模式仍杀掉整棵进程树。后台任务不受这 300 秒硬杀限制。

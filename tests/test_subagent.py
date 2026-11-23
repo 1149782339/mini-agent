@@ -137,26 +137,26 @@ def test_background_subagent_fast_completion_and_sync_compat(tmp_path, monkeypat
     seen = []
     jobs.on_complete(seen.append)
 
-    def fake_execute(task, timeout, ctx, tag, hook, job):
+    def fake_execute(task, timeout, ctx, tag, hook, record):
         return ToolOutput(f"result:{task}", {"type": "subagent", "tag": tag})
 
     monkeypatch.setattr(tool, "_execute", fake_execute)
     started = tool.call({"prompt": "background", "run_in_background": True}, ctx)
     task_id = started.meta["task_id"]
     assert "已启动后台子代理" in started.text
-    job = jobs.get(task_id)
-    assert job is not None
-    assert job.done.wait(timeout=2)
+    task = jobs.get(task_id)
+    assert task is not None
+    assert task.done.wait(timeout=2)
     deadline = time.monotonic() + 2
     while not seen and time.monotonic() < deadline:
         time.sleep(0.01)
     assert len(seen) == 1
-    assert job.owner_session_id == "session-a"
-    assert job.delivery == "wake"
+    assert task.owner_session_id == "session-a"
+    assert task.delivery == "wake"
 
     # get 不消费；终态 output 消费后，排队中的自动通知失效。
     jobs.task_manage("get", task_id, owner_session_id="session-a")
-    assert job.notification_state == "pending"
+    assert task.notification_state == "pending"
     output = jobs.task_manage("output", task_id, owner_session_id="session-a")
     assert "result:background" in output
     assert jobs.consume_notification(seen[0]) is None
@@ -183,7 +183,7 @@ def test_print_mode_rejects_background_without_starting(tmp_path, monkeypatch) -
         )
     assert exc_info.value.error_code == 24
     assert "使用同步 Task" in str(exc_info.value)
-    assert jobs.all_jobs() == []
+    assert jobs.all_tasks() == []
 
 
 def test_background_subagent_runs_real_process_protocol(tmp_path, monkeypatch) -> None:
@@ -200,13 +200,13 @@ def test_background_subagent_runs_real_process_protocol(tmp_path, monkeypatch) -
         ToolContext(tmp_path),
     )
     task_id = started.meta["task_id"]
-    job = jobs.get(task_id)
-    assert job is not None
-    assert job.done.wait(timeout=5)
-    assert job.exit_code == 0
-    assert not job.error
+    task = jobs.get(task_id)
+    assert task is not None
+    assert task.done.wait(timeout=5)
+    assert task.exit_code == 0
+    assert not task.error
     output = jobs.task_manage("output", task_id)
     assert "process-done" in output
-    assert job.meta["type"] == "subagent"
+    assert task.meta["type"] == "subagent"
 
 

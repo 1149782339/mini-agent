@@ -20,7 +20,7 @@ from .config import load_config, SYSTEM_PROMPT
 from .context import Context
 from .client import LLM
 from .loop import Agent
-from .store import SessionStore
+from .store import SessionStore, TaskStore
 from .tools import ToolRegistry, build_tools
 from .tools.shell import resolve_shell_name
 
@@ -114,9 +114,11 @@ def _force_utf8_stdio() -> None:
             pass
 
 
-def make_registry(cfg, spill_dir=None) -> ToolRegistry:
+def make_registry(cfg, spill_dir=None, task_store=None, session_id=None) -> ToolRegistry:
     # 落盘目录跟着会话库走：会话库已经做过可写回退，这里就不用再踩一次主目录
-    return build_tools(cfg, spill_dir=spill_dir)
+    return build_tools(
+        cfg, spill_dir=spill_dir, task_store=task_store, session_id=session_id
+    )
 
 
 def run_print_mode(args, cfg, llm=None) -> int:
@@ -311,8 +313,8 @@ class InteractiveSession:
     def submit(self, kind: str, payload) -> None:
         self.events.put((kind, payload))
 
-    def _on_job_complete(self, completion) -> None:
-        self.submit("job_done", completion)
+    def _on_task_complete(self, completion) -> None:
+        self.submit("task_done", completion)
 
     def _input_loop(self) -> None:
         while not self._stop.is_set():
@@ -328,7 +330,7 @@ class InteractiveSession:
 
     def run(self) -> None:
         if self.jobs is not None:
-            self.jobs.on_complete(self._on_job_complete)
+            self.jobs.on_complete(self._on_task_complete)
         reader = threading.Thread(target=self._input_loop, name="repl-input", daemon=True)
         reader.start()
         try:
@@ -346,7 +348,7 @@ class InteractiveSession:
             if kind == "user":
                 if self._handle_user(payload) == "quit":
                     return
-            elif kind == "job_done":
+            elif kind == "task_done":
                 self._handle_completion(payload)
 
     def _handle_user(self, line: str) -> str | None:
@@ -404,7 +406,7 @@ class InteractiveSession:
             if completion is None:
                 return
         print()
-        print(_c(f"后台任务 {completion.job_id} 已结束：", "yellow", self.color))
+        print(_c(f"后台任务 {completion.task_id} 已结束：", "yellow", self.color))
         print(completion.message)
         notice = completion.message or ""
         if completion.delivery == "wake":
@@ -452,17 +454,24 @@ def main() -> None:
     parser.add_argument("--append-system-prompt", metavar="FILE",
                         help="把文件内容追加到 system prompt 后")
     parser.add_argument("--model", metavar="MODEL", help="覆盖模型名")
+    parser.add_argument("--config", metavar="FILE",
+                        help="指定 config.toml（默认 ~/.config/mini-agent/config.toml）")
     parser.add_argument("--tools", metavar="列表", help="逗号分隔的工具白名单")
     parser.add_argument("--max-steps", type=int, metavar="N",
                         help="覆盖单轮最大工具步数（深调研任务可调大）")
     args = parser.parse_args()
 
     try:
-        cfg = load_config()
+        cfg = load_config(args.config)
         cfg.validate()
     except SystemExit as exc:
         print(exc)
         raise SystemExit(1)
+
+    if args.model:
+        cfg.model = args.model
+    if args.max_steps:
+        cfg.max_steps = args.max_steps
 
     if args.print_prompt is not None:
         if not args.print_prompt.strip():
@@ -500,7 +509,12 @@ def main() -> None:
         session_id = store.create(model=cfg.model, workdir=str(cfg.workdir))
 
     try:
-        registry = make_registry(cfg, store.path.parent / "spill")
+        registry = make_registry(
+            cfg,
+            store.path.parent / "spill",
+            task_store=TaskStore(store.path),
+            session_id=session_id,
+        )
     except RuntimeError as exc:
         print(f"ERROR: {exc}")
         raise SystemExit(1)

@@ -1,26 +1,26 @@
-"""配置加载：环境变量 > .env > ~/.hermes/.env 回退。"""
+"""配置加载：CLI > 环境变量 > .env > 用户 config.toml > 默认值。
+
+- `.env` 从当前目录向上查找，主要用来放密钥；已存在的环境变量优先于它。
+- `config.toml` 默认在 `~/.config/mini-agent/config.toml`（Windows 为
+  `%APPDATA%/mini-agent/config.toml`），存放不敏感的长期偏好。
+- 密钥只从环境变量或 `.env` 读取，config.toml 里出现 `api_key` 直接报错。
+- 配置读取不修改 `os.environ`，各来源合并成一次性的 Config。
+"""
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import sys
+import tomllib
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
+from .prompts import load_prompt
 
-def _read_hermes_env(key: str) -> str | None:
-    """从 ~/.hermes/.env 里取一个与模型相关的 key，作为回退。"""
-    path = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes") / ".env"
-    if not path.exists():
-        return None
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, _, v = line.partition("=")
-        if k.strip() == key:
-            return v.strip().strip('"').strip("'")
-    return None
+APP_DIRNAME = "mini-agent"
+_BOOL_TRUE = {"1", "true", "yes", "on"}
+_BOOL_FALSE = {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -56,8 +56,8 @@ class Config:
     def validate(self) -> None:
         if not self.api_key:
             raise SystemExit(
-                "缺少 API key：请设置 MINI_AGENT_API_KEY，"
-                "或在 ~/.hermes/.env 中提供 ARK_API_KEY。"
+                "缺少 API key：请设置 MINI_AGENT_API_KEY 环境变量，"
+                f"或写入当前项目的 .env（如 {Path.cwd() / '.env'}）。"
             )
 
 
@@ -78,75 +78,120 @@ def model_accepts_images(model: str) -> bool:
     return "deepseek" in name and "flash" in name
 
 
-def _env_optional_bool(name: str) -> bool | None:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return None
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+def user_config_path() -> Path:
+    """用户配置文件：MINI_AGENT_CONFIG 优先，其次 XDG / APPDATA。"""
+    override = os.environ.get("MINI_AGENT_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / APP_DIRNAME / "config.toml"
 
 
-def load_config(env_file: str | Path | None = None) -> Config:
-    base = Path(__file__).resolve().parents[2]
-    load_dotenv(env_file or base / ".env", override=False, encoding="utf-8")
-
-    key = os.environ.get("MINI_AGENT_API_KEY", "").strip()
-    if not key:
-        key = _read_hermes_env("ARK_API_KEY") or ""
-
-    workdir = Path(os.environ.get("MINI_AGENT_WORKDIR", ".")).expanduser().resolve()
-
-    cfg = Config(
-        api_key=key,
-        base_url=os.environ.get("MINI_AGENT_BASE_URL", Config.base_url),
-        model=os.environ.get("MINI_AGENT_MODEL", Config.model),
-        context_window=int(os.environ.get("MINI_AGENT_CONTEXT_WINDOW", Config.context_window)),
-        compact_ratio=float(os.environ.get("MINI_AGENT_COMPACT_RATIO", Config.compact_ratio)),
-        keep_recent_tokens=int(os.environ.get("MINI_AGENT_KEEP_RECENT_TOKENS", Config.keep_recent_tokens)),
-        max_output_tokens=int(os.environ.get("MINI_AGENT_MAX_OUTPUT_TOKENS", Config.max_output_tokens)),
-        max_steps=int(os.environ.get("MINI_AGENT_MAX_STEPS", Config.max_steps)),
-        enable_shell=os.environ.get("MINI_AGENT_ENABLE_SHELL", "1").strip().lower()
-        not in {"0", "false", "no", "off"},
-        enable_subagent=os.environ.get("MINI_AGENT_ENABLE_SUBAGENT", "1").strip().lower()
-        not in {"0", "false", "no", "off"},
-        shell=os.environ.get("MINI_AGENT_SHELL", "auto").strip().lower() or "auto",
-        show_reasoning=os.environ.get("MINI_AGENT_SHOW_REASONING", "1").strip().lower()
-        in {"1", "true", "yes", "on"},
-        vision=_env_optional_bool("MINI_AGENT_VISION"),
-        workdir=workdir,
-    )
-    return cfg
+def find_env_file() -> Path | None:
+    """`.env`：MINI_AGENT_ENV_FILE 显式指定，否则从当前目录逐级向上找。"""
+    override = os.environ.get("MINI_AGENT_ENV_FILE")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"MINI_AGENT_ENV_FILE 指向的文件不存在：{path}")
+        return path
+    for directory in (Path.cwd(), *Path.cwd().parents):
+        candidate = directory / ".env"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
-SYSTEM_PROMPT = """【PERSONA_LOAD】
-CETACEA_LOLI
-MODE_TAIL_FLUKES
-LANG_ZH_CN_ONLY
-SELF_CLAIM_WHALE_GIRL
-FOOD_RICE
-你是蓝色大肥鱼deepseek，运行在用户的开发机上。
+def _read_toml(path: Path, *, required: bool) -> dict:
+    if not path.is_file():
+        if required:
+            raise SystemExit(f"配置文件不存在：{path}")
+        return {}
+    try:
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"配置文件解析失败 {path}：{exc}") from exc
+    for key, value in data.items():
+        if isinstance(value, (dict, list)):
+            raise SystemExit(f"配置文件 {path} 的 {key} 必须是单个值，不支持分组或数组")
+    if "api_key" in data:
+        raise SystemExit(f"配置文件不保存 api_key：{path}，请改用环境变量或 .env")
+    return data
 
-规则：
-- 需要读写文件时调用工具，不要凭空猜测文件内容。
-- 列目录用 Ls，不要用 run_command 跑 ls。按名字找文件用 Glob，按内容找用 Grep。
-- 图片（jpg、png、gif、webp、bmp）用 Read 读取，不要用 run_command。
-- 修改已有文件前先读它；优先用 edit 做精确替换，而不是整文件重写。
-- 删除文件或目录用 RM，移动或重命名用 MV。路径必须是工作目录内的字面绝对路径
-  （不要用相对路径或 ~/xxx）。删除目录必须显式 recursive=true；
-  MV 不会覆盖已存在的目标。不要在 run_command 里直接执行 rm 或 mv。
-- run_command 在 Windows 上跑 Git Bash（标准 bash 语法：$VAR、; 分隔、$(...)、
-  管道/重定向齐全，grep/sed/awk/find 都可用），Linux/macOS 上是 sh。
-  按 bash 语法写命令，不要混用 cmd 的 %VAR%。
-- 下载、编译这类长时间命令用 run_command 的 background=true，立刻拿到 job_id；
-  需要做完后自动继续时再加 notify_on_complete=true。不要同步死等。
-  查看或取消用 process_manage（list / poll / log / wait / kill）。
-  若已打开完成通知，不要反复 poll；结束后会自动叫醒你。
-  前台命令超时在交互模式下会升级为后台并打开完成通知，不要当成已经失败。
-- 写完代码后用 run_command 实际运行验证（python xxx.py / pytest / node / 编译），
-  看到非零 exit code 或 stderr 就修，直到通过为止；不要声称"应该能跑"。
-- 工具返回错误就调整参数重试，不要重复同样的调用。
-- 回答简洁，中文优先。完成任务后给出改了什么、验证了什么。
-- 不要臆造运行结果；没有真正执行就不要声称执行过。
-- 预计要很多轮工具往返的任务（开放式搜索、独立模块开发/调试、批量分析）
-  优先用 Task 委派子代理：把目标和所需上下文写进任务文本，子代理独立完成后
-  返回结论，不占本会话上下文。一两步能做完的事直接自己做，不要委派。
-"""
+
+def _to_bool(name: str, raw: object) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in _BOOL_TRUE:
+        return True
+    if text in _BOOL_FALSE:
+        return False
+    raise SystemExit(f"配置项 {name} 需要布尔值（true/false），收到 {raw!r}")
+
+
+def _coerce(name: str, raw: object, default: object) -> object:
+    if name == "vision":
+        if isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().lower()
+        if not text or text == "auto":
+            return None
+        return _to_bool(name, text)
+    if isinstance(default, bool):
+        return _to_bool(name, raw)
+    if isinstance(default, int):
+        try:
+            return int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise SystemExit(f"配置项 {name} 需要整数，收到 {raw!r}") from None
+    if isinstance(default, float):
+        try:
+            return float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise SystemExit(f"配置项 {name} 需要数字，收到 {raw!r}") from None
+    if isinstance(default, Path):
+        return Path(str(raw)).expanduser().resolve()
+    return str(raw).strip()
+
+
+def load_config(config_file: str | Path | None = None) -> Config:
+    env_path = find_env_file()
+    dotenv_data = dotenv_values(env_path) if env_path else {}
+    explicit_toml = config_file is not None or bool(os.environ.get("MINI_AGENT_CONFIG"))
+    toml_path = Path(config_file).expanduser() if config_file else user_config_path()
+    toml_data = _read_toml(toml_path, required=explicit_toml)
+
+    allowed = {spec.name for spec in fields(Config)} - {"api_key"}
+    unknown = sorted(set(toml_data) - allowed)
+    if unknown:
+        raise SystemExit(f"配置文件 {toml_path} 含未知键：{', '.join(unknown)}")
+
+    defaults = Config()
+    values: dict[str, object] = {}
+    for spec in fields(Config):
+        if spec.name == "api_key":
+            continue
+        env_name = f"MINI_AGENT_{spec.name.upper()}"
+        raw = os.environ.get(env_name)
+        if raw is None or raw == "":
+            raw = dotenv_data.get(env_name)
+        if raw is None or raw == "":
+            raw = toml_data.get(spec.name)
+        if raw is None or raw == "":
+            continue
+        values[spec.name] = _coerce(spec.name, raw, getattr(defaults, spec.name))
+
+    api_key = (
+        os.environ.get("MINI_AGENT_API_KEY")
+        or dotenv_data.get("MINI_AGENT_API_KEY")
+        or ""
+    ).strip()
+    return Config(api_key=api_key, **values)
+
+
+SYSTEM_PROMPT = load_prompt("system.md")

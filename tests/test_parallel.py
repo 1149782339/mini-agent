@@ -286,20 +286,20 @@ def test_busy_agent_injects_completion_after_tool_results(tmp_path: Path) -> Non
         parameters = {"type": "object", "properties": {}, "additionalProperties": False}
 
         def call(self, args, ctx) -> ToolOutput:
-            job = jobs.add_task(
-                lambda _job: ToolOutput("background-done"),
+            task = jobs.add_task(
+                lambda _task: ToolOutput("background-done"),
                 command="demo",
                 cwd=tmp_path,
                 kind="subagent",
                 delivery="wake",
             )
-            assert job.done.wait(timeout=2)
+            assert task.done.wait(timeout=2)
             # worker 已结束，但在 tool 结果补齐前不得直接写父会话。
             assert all(
                 "background-done" not in str(message)
                 for message in agent.ctx.messages
             )
-            return ToolOutput(f"started:{job.job_id}")
+            return ToolOutput(f"started:{task.task_id}")
 
     class TwoStepLLM:
         def __init__(self) -> None:

@@ -36,22 +36,11 @@ from .base import (
     semantic_int,
 )
 from ..envutil import sanitize_subprocess_env
+from ..prompts import load_prompt
 from .shell import WindowsJob, kill_process_tree
 
 # 子代理的 system prompt：明确身份、工作方式和返回格式
-CHILD_SYSTEM_PROMPT = """\
-你是一个被主代理派发的子代理，在用户的开发机上独立执行一个任务。
-
-工作方式：
-- 用 Read/Ls/Glob/Grep 了解现状，用 Edit/Write 修改文件，删除用 RM，移动或重命名用 MV，用 run_command 验证。不要在 shell 里直接执行 rm 或 mv。
-- 做完必须实际验证（跑测试 / 运行 / 语法检查），不要声称没做过的验证。
-- 不擅长的细节宁可再读文件确认，不要臆造路径和内容。
-
-返回格式（最后一条消息，即你的返回值）：
-- 第一段：任务完成情况的结论（做了什么、验证了什么、结果如何）。
-- 随后按需列出：改动的文件路径清单、关键发现、遗留问题。
-- 不要寒暄，不要复述任务，内容控制在 500 字内，细节留给文件。\
-"""
+CHILD_SYSTEM_PROMPT = load_prompt("subagent.md")
 
 # 子代理默认工具白名单（Task 已在 print 模式被摘除，双重保险不列它）
 CHILD_TOOLS = "Read,Edit,Write,RM,MV,Glob,Grep,Ls,run_command"
@@ -172,7 +161,7 @@ def build_child_env(
     """构造子代理进程的环境。
 
     剥离父进程里的 API key 等密钥。子进程启动时由 load_config() 自行从
-    项目 .env 或 ~/.hermes/.env 读取密钥，不靠继承父进程环境。
+    当前目录上层的 .env 读取密钥，不靠继承父进程环境。
     MINI_AGENT_MAX_STEPS 仍由父进程显式写入，覆盖子代理步数预算。
     """
     env = sanitize_subprocess_env(base)
@@ -305,7 +294,7 @@ class SubagentTool(Tool):
     def call(self, args: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         from ..jobs import TaskLimitError
 
-        task = args["prompt"].strip()
+        prompt = args["prompt"].strip()
         timeout = semantic_int(args.get("timeout"), DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT
         timeout = max(60, min(int(timeout), 3600))
         background = semantic_bool(args.get("run_in_background"), False)
@@ -322,9 +311,9 @@ class SubagentTool(Tool):
         hook = getattr(ctx, "event_hook", None)
         owner = getattr(ctx, "session_id", None)
         try:
-            job = self.jobs.add_task(
-                lambda task_job: self._execute(task, timeout, ctx, tag, hook, task_job),
-                command=task,
+            task = self.jobs.add_task(
+                lambda record: self._execute(prompt, timeout, ctx, tag, hook, record),
+                command=prompt,
                 cwd=ctx.workdir,
                 kind="subagent",
                 owner_session_id=owner,
@@ -336,28 +325,28 @@ class SubagentTool(Tool):
 
         if background:
             return ToolOutput(
-                f"[已启动后台子代理 {job.job_id}]\n"
-                f"task_id={job.job_id}\n"
+                f"[已启动后台子代理 {task.task_id}]\n"
+                f"task_id={task.task_id}\n"
                 "任务完成后会自动送回结果；无需反复查询。可用 task_manage 的 "
                 "list/get/output/wait/cancel 控制，wait 超时不会取消任务。",
-                {"type": "subagent", "task_id": job.job_id, "background": True},
+                {"type": "subagent", "task_id": task.task_id, "background": True},
             )
 
         try:
-            finished = job.done.wait(timeout=timeout + 5)
+            finished = task.done.wait(timeout=timeout + 5)
         except KeyboardInterrupt:
-            self.jobs.task_manage("cancel", job.job_id)
+            self.jobs.task_manage("cancel", task.task_id)
             raise
         if not finished:
-            self.jobs.task_manage("cancel", job.job_id)
-            raise ToolError(f"子代理任务 {job.job_id} 未在截止时间后退出", 21)
-        if job.error:
-            raise ToolError(job.error, job.error_code)
-        meta = dict(job.meta)
-        meta["task_id"] = job.job_id
-        return ToolOutput(job.result or "(子代理未返回文本结果)", meta)
+            self.jobs.task_manage("cancel", task.task_id)
+            raise ToolError(f"子代理任务 {task.task_id} 未在截止时间后退出", 21)
+        if task.error:
+            raise ToolError(task.error, task.error_code)
+        meta = dict(task.meta)
+        meta["task_id"] = task.task_id
+        return ToolOutput(task.result or "(子代理未返回文本结果)", meta)
 
-    def _execute(self, task: str, timeout: int, ctx: ToolContext, tag: str, hook, job) -> ToolOutput:
+    def _execute(self, prompt: str, timeout: int, ctx: ToolContext, tag: str, hook, task) -> ToolOutput:
         """同步与后台共用的子进程执行器；只返回结果，不碰父会话。"""
         def _report(step: int, tokens: int, snippet: str, status: str,
                     exit_code: int | None = None) -> None:
@@ -365,7 +354,7 @@ class SubagentTool(Tool):
                 hook("subagent_progress", {
                     "tag": tag, "step": step, "tokens": tokens,
                     "snippet": snippet, "status": status, "exit": exit_code,
-                    "task_id": job.job_id,
+                    "task_id": task.task_id,
                 })
 
         debug = os.environ.get("MINI_AGENT_DEBUG", "").strip() in {"1", "true"}
@@ -378,8 +367,8 @@ class SubagentTool(Tool):
                     f"(+{time.monotonic() - _t0:.2f}s)\n"
                 )
 
-        if job.cancel_event.is_set():
-            raise ToolError(f"子代理任务 {job.job_id} 已取消", 26)
+        if task.cancel_event.is_set():
+            raise ToolError(f"子代理任务 {task.task_id} 已取消", 26)
 
         # system prompt 走临时文件，经 --append-system-prompt 传给子进程
         tmp = tempfile.NamedTemporaryFile(
@@ -388,9 +377,9 @@ class SubagentTool(Tool):
         try:
             tmp.write(CHILD_SYSTEM_PROMPT)
             tmp.close()
-            argv = build_child_argv(task, tmp.name)
+            argv = build_child_argv(prompt, tmp.name)
             # 子进程是独立 load_config()：步数预算经环境变量给它（深调研默认 150 步）。
-            # 密钥不从父进程环境继承，由子进程自己读项目 .env / ~/.hermes/.env。
+            # 密钥不从父进程环境继承，由子进程自己读当前目录上层的 .env。
             child_env = build_child_env(os.environ, CHILD_MAX_STEPS)
             _dbg("tmpfile-ready")
             popen_kwargs: dict[str, Any] = dict(
@@ -411,15 +400,15 @@ class SubagentTool(Tool):
                 proc = subprocess.Popen(argv, **popen_kwargs)
             except OSError as exc:
                 raise ToolError(f"无法启动子代理进程：{exc}", 20) from None
-            job.proc = proc
+            task.proc = proc
             _dbg("popen-done")
 
             win_job = WindowsJob() if WindowsJob is not None else None
             if win_job is not None:
                 win_job.attach(proc)
-            job.win_job = win_job
+            task.win_job = win_job
             _ACTIVE_PROCS[id(proc)] = (proc, win_job)
-            if job.cancel_event.is_set():
+            if task.cancel_event.is_set():
                 _kill_proc(proc, win_job)
             _dbg("pre-drain")
             # stderr 并发排空，避免 PIPE 写满后冻死子进程。
@@ -462,14 +451,14 @@ class SubagentTool(Tool):
                 _ACTIVE_PROCS.pop(id(proc), None)
                 if win_job is not None:
                     win_job.close()
-                    job.win_job = None
+                    task.win_job = None
             err = "".join(stderr_chunks)
-            job.append("stderr", err)
+            task.append("stderr", err)
         finally:
             Path(tmp.name).unlink(missing_ok=True)
 
         out = "".join(lines)
-        job.append("stdout", out)
+        task.append("stdout", out)
         parsed = parse_json_events(out)
 
         if parsed["error"] and not parsed["final"]:

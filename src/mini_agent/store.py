@@ -14,8 +14,10 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .tokens import content_text
@@ -53,6 +55,27 @@ CREATE TABLE IF NOT EXISTS session_events (
     created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON session_events(session_id, id);
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id            TEXT PRIMARY KEY,
+    owner_session_id   TEXT,
+    status             TEXT NOT NULL,
+    notification_state TEXT NOT NULL,
+    payload            TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_session_id, status);
+"""
+
+TASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id            TEXT PRIMARY KEY,
+    owner_session_id   TEXT,
+    status             TEXT NOT NULL,
+    notification_state TEXT NOT NULL,
+    payload            TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_session_id, status);
 """
 
 COMPACTION_MARKER = "[COMPACTION]"
@@ -125,6 +148,68 @@ def _is_marker(message: dict) -> bool:
 
 def _system_message(system_prompt: str) -> dict:
     return {"role": "system", "content": system_prompt}
+
+
+class TaskStore:
+    """后台任务快照；每次操作使用独立连接，允许 worker 线程安全写入。
+
+    SessionStore 仍只由主线程使用。这里不保存会话消息，也不直接写通知历史，
+    只保存任务终态、输出与通知消费状态，供下次进程启动时恢复。
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path).expanduser()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        with self._connection() as conn:
+            conn.executescript(TASK_SCHEMA)
+
+    @contextmanager
+    def _connection(self):
+        with self._lock:
+            conn = sqlite3.connect(self.path, timeout=5)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def save_task(self, snapshot: dict) -> None:
+        payload = json.dumps(snapshot, ensure_ascii=False, default=str)
+        with self._connection() as conn:
+            conn.execute(
+                """INSERT INTO tasks
+                   (task_id, owner_session_id, status, notification_state, payload, updated_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(task_id) DO UPDATE SET
+                       owner_session_id=excluded.owner_session_id,
+                       status=excluded.status,
+                       notification_state=excluded.notification_state,
+                       payload=excluded.payload,
+                       updated_at=excluded.updated_at""",
+                (
+                    snapshot["task_id"],
+                    snapshot.get("owner_session_id"),
+                    snapshot["status"],
+                    snapshot["notification_state"],
+                    payload,
+                    _now(),
+                ),
+            )
+
+    def delete_task(self, task_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+
+    def load_tasks(self) -> list[dict]:
+        with self._connection() as conn:
+            rows = conn.execute("SELECT payload FROM tasks ORDER BY rowid").fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
 
 class SessionStore:

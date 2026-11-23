@@ -36,7 +36,12 @@ __all__ = [
 ]
 
 
-def build_tools(cfg, spill_dir: Path | None = None) -> ToolRegistry:
+def build_tools(
+    cfg,
+    spill_dir: Path | None = None,
+    task_store=None,
+    session_id: str | None = None,
+) -> ToolRegistry:
     """按配置组装注册表：Read/Edit/Write/RM/MV/Glob/Grep/Ls + 可选 run_command。
 
     文件工具共享一个 FileToolContext（workdir + 读状态缓存）——
@@ -51,8 +56,8 @@ def build_tools(cfg, spill_dir: Path | None = None) -> ToolRegistry:
         registry = ToolRegistry(max_output=cfg.max_tool_output, context=fctx)
     for tool in (ReadTool(), EditTool(), WriteTool(), RMTool(), MVTool(), GlobTool(), GrepTool(), LsTool()):
         registry.register(tool)
-    from ..jobs import JobRegistry
-    jobs = JobRegistry()
+    from ..jobs import TaskRegistry
+    jobs = TaskRegistry(task_store=task_store, owner_session_id=session_id)
     registry.jobs = jobs
     registry.register(TaskManageTool(jobs))
     if cfg.enable_shell:

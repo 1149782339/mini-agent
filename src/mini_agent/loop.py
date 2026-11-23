@@ -87,7 +87,7 @@ class Agent:
         self._pending_completions = deque()
         self._completion_lock = threading.Lock()
         if self.jobs is not None:
-            self.jobs.on_complete(self._on_job_complete)
+            self.jobs.on_complete(self._on_task_complete)
         if store is not None and session_id:
             view = store.load_view(session_id, system_prompt=self.ctx.system_prompt)
             # 新会话视图只有注入的 system，与 Context 默认值一致
@@ -218,7 +218,7 @@ class Agent:
             " Write（每个 ≤100 行），或减少不必要的推理长度。"
         )
 
-    def _on_job_complete(self, completion) -> None:
+    def _on_task_complete(self, completion) -> None:
         """任务 worker 只入队；不得在这里写 Context、Store 或调用 run。"""
         with self._completion_lock:
             self._pending_completions.append(completion)
