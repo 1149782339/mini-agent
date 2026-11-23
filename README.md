@@ -83,6 +83,10 @@ stat 会触发 SMB 连接，造成 NTLM 凭据泄漏。
 - **Grep**：ripgrep 的 content / files_with_matches / count，以及
   `-i` / `-A` / `-B` / `-C`、glob、type、multiline、`head_limit` + `offset`。
   超时和无匹配是两种结果。
+- **AskUser**：一次询问 1-4 个结构化问题，支持单选、多选和自定义文本。
+  交互式 CLI 可输入编号、选项原文或自定义回答，多选用逗号分隔；`/skip` 跳过，
+  `/cancel` 取消，默认 90 秒超时。核心工具只依赖可选 `interaction_handler`；
+  print 模式和 Task 子代理没有 handler，会立即返回 `unavailable`，由模型自行判断，不会等待输入。
 - **Task**：子代理委派。子代理是独立进程（`python -m mini_agent -p`），
   不继承父会话。交接物只有子代理 system prompt 和父模型写好的任务文本。
   子代理自己读写文件、运行命令，返回最后一条 assistant 文本（50000 字符截断）。

@@ -21,6 +21,7 @@ except ImportError:  # rich 是硬依赖，但保持降级 gracefully
 from .config import load_config, SYSTEM_PROMPT
 from .context import Context
 from .client import LLM
+from .cli_interaction import CLIInteractionHandler
 from .loop import Agent
 from .store import SessionStore, TaskStore
 from .tools import ToolRegistry, build_tools
@@ -116,10 +117,16 @@ def _force_utf8_stdio() -> None:
             pass
 
 
-def make_registry(cfg, spill_dir=None, task_store=None, session_id=None) -> ToolRegistry:
+def make_registry(
+    cfg, spill_dir=None, task_store=None, session_id=None, interaction_handler=None
+) -> ToolRegistry:
     # 落盘目录跟着会话库走：会话库已经做过可写回退，这里就不用再踩一次主目录
     return build_tools(
-        cfg, spill_dir=spill_dir, task_store=task_store, session_id=session_id
+        cfg,
+        spill_dir=spill_dir,
+        task_store=task_store,
+        session_id=session_id,
+        interaction_handler=interaction_handler,
     )
 
 
@@ -303,7 +310,10 @@ class InteractiveSession:
     退出或 Ctrl+C 离开 REPL 时清掉仍在跑的后台进程。
     """
 
-    def __init__(self, agent, store, session_id: str, registry, printer, color: bool, jobs):
+    def __init__(
+        self, agent, store, session_id: str, registry, printer, color: bool, jobs,
+        interaction=None,
+    ):
         self.agent = agent
         self.store = store
         self.session_id = session_id
@@ -311,10 +321,14 @@ class InteractiveSession:
         self.printer = printer
         self.color = color
         self.jobs = jobs
+        self.interaction = interaction
         self.events: queue.Queue = queue.Queue()
         self._stop = threading.Event()
 
     def submit(self, kind: str, payload) -> None:
+        if self.interaction is not None and self.interaction.route(kind, payload):
+            if kind != "eof":
+                return
         self.events.put((kind, payload))
 
     def _on_task_complete(self, completion) -> None:
@@ -341,6 +355,8 @@ class InteractiveSession:
             self._dispatch_loop()
         finally:
             self._stop.set()
+            if self.interaction is not None:
+                self.interaction.close()
             if self.jobs is not None:
                 self.jobs.cleanup_all()
 
@@ -520,12 +536,14 @@ def main() -> None:
     if session_id is None:
         session_id = store.create(model=cfg.model, workdir=str(cfg.workdir))
 
+    interaction = CLIInteractionHandler()
     try:
         registry = make_registry(
             cfg,
             store.path.parent / "spill",
             task_store=TaskStore(store.path),
             session_id=session_id,
+            interaction_handler=interaction.ask,
         )
     except RuntimeError as exc:
         print(f"ERROR: {exc}")
@@ -558,7 +576,8 @@ def main() -> None:
 
     jobs = getattr(registry, "jobs", None)
     session = InteractiveSession(
-        agent, store, session_id, registry, printer, color, jobs
+        agent, store, session_id, registry, printer, color, jobs,
+        interaction=interaction,
     )
     try:
         session.run()

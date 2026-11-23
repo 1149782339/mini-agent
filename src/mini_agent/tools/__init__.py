@@ -15,6 +15,7 @@ from .base import (
     semantic_bool,
     semantic_int,
 )
+from .ask_user import AskUserTool
 from .edit import EditTool
 from .filestate import FileState, FileStateCache, FileToolContext
 from .glob_tool import GlobTool
@@ -30,8 +31,8 @@ __all__ = [
     "FnTool", "Tool", "ToolContext", "ToolError", "ToolOutput", "ToolRegistry",
     "ValidationResult", "decode_output", "semantic_bool", "semantic_int",
     "FileState", "FileStateCache", "FileToolContext",
-    "ReadTool", "EditTool", "WriteTool", "RMTool", "MVTool", "GlobTool", "GrepTool", "LsTool",
-    "ShellTools", "SubagentTool", "TaskManageTool",
+    "AskUserTool", "ReadTool", "EditTool", "WriteTool", "RMTool", "MVTool",
+    "GlobTool", "GrepTool", "LsTool", "ShellTools", "SubagentTool", "TaskManageTool",
     "build_tools",
 ]
 
@@ -41,12 +42,9 @@ def build_tools(
     spill_dir: Path | None = None,
     task_store=None,
     session_id: str | None = None,
+    interaction_handler=None,
 ) -> ToolRegistry:
-    """按配置组装注册表：Read/Edit/Write/RM/MV/Glob/Grep/Ls + 可选 run_command。
-
-    文件工具共享一个 FileToolContext（workdir + 读状态缓存）——
-    read-before-write、staleness 闸、file_unchanged 去重都靠它串联。
-    """
+    """按配置组装注册表：文件/搜索工具、AskUser 与可选 Shell、Task。"""
     fctx = FileToolContext(cfg.workdir)
     if spill_dir is not None:
         registry = ToolRegistry(
@@ -56,6 +54,7 @@ def build_tools(
         registry = ToolRegistry(max_output=cfg.max_tool_output, context=fctx)
     for tool in (ReadTool(), EditTool(), WriteTool(), RMTool(), MVTool(), GlobTool(), GrepTool(), LsTool()):
         registry.register(tool)
+    registry.register(AskUserTool(interaction_handler))
     from ..jobs import TaskRegistry
     jobs = TaskRegistry(task_store=task_store, owner_session_id=session_id)
     registry.jobs = jobs
